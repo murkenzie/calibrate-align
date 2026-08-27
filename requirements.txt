@@ -1,0 +1,5 @@
+# Core numerical dependencies. Install GPU-specific PyTorch and model projects
+# separately, as described in README.md.
+numpy>=1.26,<2.0
+scipy>=1.11,<2.0
+opencv-python>=4.8,<5.0

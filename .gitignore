@@ -1,0 +1,61 @@
+# Local environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Keep all private data and generated runs below this directory
+local/
+data/
+datasets/
+images/
+output/
+outputs/
+results/
+multialign_all_roma_result/
+dataset_adapter/
+runs/
+
+# Camera and spectral source data
+*.dng
+*.raw
+*.pkl
+*.pickle
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+
+# Model weights, arrays, caches and logs
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.npy
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

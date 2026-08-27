@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "example_only": true,
+  "warning": "Replace all anonymous example values before use. Reference intrinsics must be measured; target K is only an optimization seed.",
+  "cameras": {
+    "camera_left": {
+      "intrinsics_known": true,
+      "image_size": [1000, 750],
+      "K": [[900.0, 0.0, 500.0], [0.0, 900.0, 375.0], [0.0, 0.0, 1.0]],
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "camera_right": {
+      "intrinsics_known": true,
+      "image_size": [1000, 750],
+      "K": [[950.0, 0.0, 500.0], [0.0, 950.0, 375.0], [0.0, 0.0, 1.0]],
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "camera_target": {
+      "intrinsics_known": false,
+      "image_size": [1000, 750],
+      "K": [[1000.0, 0.0, 500.0], [0.0, 1000.0, 375.0], [0.0, 0.0, 1.0]],
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0],
+      "note": "K is an optimization seed, not a known calibration."
+    }
+  }
+}

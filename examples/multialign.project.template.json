@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "rig": {
+    "reference_cameras": ["camera_left", "camera_right"],
+    "target_camera": "camera_target",
+    "anchor_camera": "camera_left",
+    "scale_reference_camera": "camera_right"
+  },
+  "paths": {
+    "calibration_images": "inputs/calibration/images",
+    "scene_images": "inputs/scenes/images",
+    "initial_calibration": "inputs/calibration/initial_calibration.json",
+    "depth_anything_root": "external/Depth-Anything-V2",
+    "depth_checkpoint": "models/depth_anything_v2_vits.pth",
+    "calibration_run": "runs/calibration",
+    "alignment_run": "runs/alignment"
+  },
+  "runtime": {
+    "roma_setting": "fast",
+    "cross_representation": "gray",
+    "depth_prior_cameras": ["camera_left", "camera_right"],
+    "reference_depth_camera": "camera_left",
+    "final_depth_source": "model-raw",
+    "encoder": "vits",
+    "device": "auto",
+    "precision": "auto",
+    "allow_cpu": false
+  }
+}
