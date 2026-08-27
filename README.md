@@ -195,6 +195,6 @@ and anonymous templates belong in version control.
 
 ## License
 
-No open-source license is currently granted. Add one only after confirming the
-intended terms and the licenses of RoMa v2, Depth Anything V2, PyTorch, OpenCV,
-and any optional segmentation dependency.
+The source code in this repository is available under the MIT License. RoMa v2,
+Depth Anything V2, PyTorch, OpenCV, and any optional segmentation dependency
+remain subject to their own licenses and model terms.

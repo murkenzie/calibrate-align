@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,18 @@ name = "multi-camera-unknown-intrinsics-alignment"
 version = "2.0.0"
 description = "Calibrate a fixed rig with 2+ known-intrinsics cameras and align them to one unknown-intrinsics camera"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26,<2.0",
   "scipy>=1.11,<2.0",
   "opencv-python>=4.8,<5.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/murkenzie/calibrate-align"
+Issues = "https://github.com/murkenzie/calibrate-align/issues"
 
 [project.scripts]
 multialign = "multialign.cli:main"
