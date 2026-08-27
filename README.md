@@ -186,13 +186,6 @@ This repository does not download model weights or embed access credentials.
 - Inspect held-out error, coverage, intrinsics drift, baseline ratios, and
   degeneracy diagnostics together; one RMS value is not enough.
 
-## Data safety
-
-The project-level ignore file excludes `inputs/`, `models/`, `external/`, and
-`runs/`. The source repository also excludes common images, checkpoints,
-arrays, logs, local configuration, and credentials. Only source, documentation,
-and anonymous templates belong in version control.
-
 ## License
 
 The source code in this repository is available under the MIT License. RoMa v2,
