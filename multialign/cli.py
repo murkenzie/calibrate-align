@@ -1,4 +1,4 @@
-"""Unified command-line interface for generic fixed-rig alignment."""
+"""Unified command-line interface for rough- or known-calibration alignment."""
 
 from __future__ import annotations
 
@@ -48,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="multialign",
         description=(
-            "Calibrate a fixed rig with 2+ known-intrinsics reference cameras and "
-            "align them into one unknown-intrinsics target camera"
+            "Calibrate 2+ reference cameras and one target from known or rough "
+            "intrinsics, then align references into the target grid"
         ),
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -62,11 +62,24 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(DEFAULT_REFERENCE_CAMERAS),
         metavar="CAMERA",
-        help="two or more cameras with known intrinsics",
+        help="two or more reference cameras",
     )
     init.add_argument("--target", default=DEFAULT_TARGET_CAMERA)
     init.add_argument("--anchor", default=None)
     init.add_argument("--scale-reference", default=None)
+    init.add_argument(
+        "--all-intrinsics-unknown",
+        action="store_true",
+        help=(
+            "generate auto-K templates for image-size/35mm-equivalent seeds and "
+            "refine K with weak priors"
+        ),
+    )
+    init.add_argument(
+        "--allow-pose-drift",
+        action="store_true",
+        help="enable guarded per-frame essential-pose refinement",
+    )
 
     layout = commands.add_parser("layout", help="show the stage-to-stage file contract")
     layout.add_argument("project", nargs="?", type=Path)
@@ -103,6 +116,13 @@ def _runtime(paths: ProjectPaths) -> dict:
     return value
 
 
+def _config_section(paths: ProjectPaths, name: str) -> dict:
+    value = paths.config.get(name, {})
+    if not isinstance(value, dict):
+        raise ProjectError(f"{name} must be a JSON object")
+    return value
+
+
 def _role_args(paths: ProjectPaths, *, include_scale: bool) -> list[str]:
     output = [
         "--reference-cameras",
@@ -122,6 +142,7 @@ def _calibration_args(paths: ProjectPaths, extra: Sequence[str]) -> list[str]:
     if blocked:
         raise ProjectError(f"{blocked} is managed by multialign.project.json")
     runtime = _runtime(paths)
+    calibration = _config_section(paths, "calibration")
     output = [
         "--data-root",
         str(paths.calibration_images),
@@ -134,6 +155,16 @@ def _calibration_args(paths: ProjectPaths, extra: Sequence[str]) -> list[str]:
         str(runtime.get("roma_setting", "fast")),
         "--cross-representation",
         str(runtime.get("cross_representation", "gray")),
+        "--reference-intrinsics",
+        str(calibration.get("reference_intrinsics", "auto")),
+        "--target-model",
+        str(calibration.get("target_model", "auto")),
+        "--reference-distortion",
+        str(calibration.get("reference_distortion", "fixed")),
+        "--target-distortion",
+        str(calibration.get("target_distortion", "fixed")),
+        "--rig-motion-model",
+        str(calibration.get("rig_motion_model", "fixed")),
     ]
     if bool(runtime.get("allow_cpu", False)):
         output.append("--allow-cpu")
@@ -146,6 +177,7 @@ def _alignment_args(paths: ProjectPaths, extra: Sequence[str]) -> list[str]:
     if blocked:
         raise ProjectError(f"{blocked} is managed by multialign.project.json")
     runtime = _runtime(paths)
+    alignment = _config_section(paths, "alignment")
     prior_cameras = runtime.get(
         "depth_prior_cameras", list(paths.reference_cameras[:2])
     )
@@ -188,6 +220,32 @@ def _alignment_args(paths: ProjectPaths, extra: Sequence[str]) -> list[str]:
         reference_depth,
         "--final-depth-source",
         str(runtime.get("final_depth_source", "model-raw")),
+        "--render-mode",
+        str(alignment.get("render_mode", "strict")),
+        "--pose-refinement",
+        str(alignment.get("pose_refinement", "off")),
+        "--pose-refine-ransac-threshold",
+        str(alignment.get("pose_refine_ransac_threshold", 1.5)),
+        "--pose-refine-ransac-max-iters",
+        str(alignment.get("pose_refine_ransac_max_iters", 10000)),
+        "--pose-refine-max-samples",
+        str(alignment.get("pose_refine_max_samples", 5000)),
+        "--pose-refine-homography-threshold",
+        str(alignment.get("pose_refine_homography_threshold", 2.0)),
+        "--pose-refine-max-homography-dominance",
+        str(alignment.get("pose_refine_max_homography_dominance", 0.95)),
+        "--pose-refine-max-rotation-deg",
+        str(alignment.get("pose_refine_max_rotation_deg", 3.0)),
+        "--pose-refine-max-translation-deg",
+        str(alignment.get("pose_refine_max_translation_deg", 8.0)),
+        "--pose-refine-min-inliers",
+        str(alignment.get("pose_refine_min_inliers", 80)),
+        "--pose-refine-min-inlier-ratio",
+        str(alignment.get("pose_refine_min_inlier_ratio", 0.25)),
+        "--pose-refine-min-improvement",
+        str(alignment.get("pose_refine_min_improvement", 0.05)),
+        "--pose-refine-strength",
+        str(alignment.get("pose_refine_strength", 1.0)),
     ]
     if bool(runtime.get("allow_cpu", False)):
         output.append("--allow-cpu")
@@ -322,6 +380,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.target,
                 args.anchor,
                 args.scale_reference,
+                args.all_intrinsics_unknown,
+                args.allow_pose_drift,
             )
             print(f"Project initialized: {paths.root}")
             for path in created:

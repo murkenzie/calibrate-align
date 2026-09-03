@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 
-PROGRAM_VERSION = "2.0"
+PROGRAM_VERSION = "2.1"
 REFERENCE_CAMERAS = ("reference_a", "reference_b")
 TARGET_CAMERA = "target"
 ANCHOR_CAMERA = REFERENCE_CAMERAS[0]
@@ -458,16 +458,34 @@ def valid_json_and_files(report: Path, files: Iterable[Path]) -> bool:
     return True
 
 
-def geometry_complete(directory: Path) -> bool:
+def geometry_complete(
+    directory: Path, expected_pose_refinement: str | None = None
+) -> bool:
     if (directory / ".geometry_incomplete").exists():
         return False
-    return valid_json_and_files(
-        directory / "alignment_report.json",
+    report_path = directory / "alignment_report.json"
+    if not valid_json_and_files(
+        report_path,
         (directory / "depth_alignment_maps.npz",),
+    ):
+        return False
+    if expected_pose_refinement is None:
+        return True
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    settings = report.get("settings", {})
+    return isinstance(settings, dict) and settings.get("pose_refinement", "off") == (
+        expected_pose_refinement
     )
 
 
-def frame_complete(directory: Path, reference_cameras: Sequence[str]) -> bool:
+def frame_complete(
+    directory: Path,
+    reference_cameras: Sequence[str],
+    expected_render_mode: str | None = None,
+) -> bool:
     if (directory / ".pipeline_incomplete").exists():
         return False
     report = directory / "frame_report.json"
@@ -496,7 +514,12 @@ def frame_complete(directory: Path, reference_cameras: Sequence[str]) -> bool:
         value = read_json(report)
     except PipelineError:
         return False
-    return value.get("status") == "success"
+    if value.get("status") != "success":
+        return False
+    if expected_render_mode is None:
+        return True
+    # Reports produced before render_mode existed used completed renders.
+    return value.get("render_mode", "complete") == expected_render_mode
 
 
 def geometry_command(args: argparse.Namespace, frame: str, output: Path) -> list[str]:
@@ -512,6 +535,18 @@ def geometry_command(args: argparse.Namespace, frame: str, output: Path) -> list
         "--output-dir", str(output),
         "--roma-setting", args.roma_setting,
         "--representation", args.representation,
+        "--pose-refinement", args.pose_refinement,
+        "--pose-refine-ransac-threshold", str(args.pose_refine_ransac_threshold),
+        "--pose-refine-ransac-max-iters", str(args.pose_refine_ransac_max_iters),
+        "--pose-refine-max-samples", str(args.pose_refine_max_samples),
+        "--pose-refine-homography-threshold", str(args.pose_refine_homography_threshold),
+        "--pose-refine-max-homography-dominance", str(args.pose_refine_max_homography_dominance),
+        "--pose-refine-max-rotation-deg", str(args.pose_refine_max_rotation_deg),
+        "--pose-refine-max-translation-deg", str(args.pose_refine_max_translation_deg),
+        "--pose-refine-min-inliers", str(args.pose_refine_min_inliers),
+        "--pose-refine-min-inlier-ratio", str(args.pose_refine_min_inlier_ratio),
+        "--pose-refine-min-improvement", str(args.pose_refine_min_improvement),
+        "--pose-refine-strength", str(args.pose_refine_strength),
         "--fb-threshold", str(args.geometry_fb_threshold),
         "--epipolar-threshold", str(args.geometry_epipolar_threshold),
         "--reprojection-threshold", str(args.geometry_reprojection_threshold),
@@ -560,6 +595,7 @@ def prior_command(
         "--prior-cameras", *args.prior_cameras,
         "--reference-depth-camera", args.reference_depth_camera,
         "--final-depth-source", args.final_depth_source,
+        "--render-mode", args.render_mode,
         "--segmentation-backend", args.segmentation_backend,
         "--render-unresolved-max-component-area", str(args.render_unresolved_max_component_area),
         "--render-fill-texture-method", args.render_fill_texture_method,
@@ -663,15 +699,18 @@ def rendering_metrics(
     try:
         report = read_json(report_path)
         anchor = report.get("rendering", {}).get(anchor_camera, {})
-        coverage = 100.0 * sum(
-            float(anchor.get(key, 0.0))
-            for key in (
-                "zbuffer_visible_ratio",
-                "occlusion_surface_filled_ratio",
-                "occlusion_relaxed_filled_ratio",
-                "display_filled_ratio",
+        if "primary_valid_ratio" in anchor:
+            coverage = 100.0 * float(anchor["primary_valid_ratio"])
+        else:
+            coverage = 100.0 * sum(
+                float(anchor.get(key, 0.0))
+                for key in (
+                    "zbuffer_visible_ratio",
+                    "occlusion_surface_filled_ratio",
+                    "occlusion_relaxed_filled_ratio",
+                    "display_filled_ratio",
+                )
             )
-        )
         coverage = min(max(coverage, 0.0), 100.0)
         unresolved = float(anchor["occlusion_unresolved_ratio"]) * 100.0
         return coverage, unresolved
@@ -779,7 +818,7 @@ def save_summaries(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="从多相机同名图片批量完成几何、单目深度、对齐、补全和结果总览"
+        description="从多相机同名图片批量完成几何、单目深度、带可见性mask的对齐和结果总览"
     )
     parser.add_argument("--version", action="version", version=PROGRAM_VERSION)
     parser.add_argument("--reference-cameras", nargs="+", required=True)
@@ -820,6 +859,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="fast",
     )
     parser.add_argument("--representation", choices=("gray", "rgb", "structure"), default="gray")
+    parser.add_argument("--pose-refinement", choices=("off", "essential"), default="off")
+    parser.add_argument("--pose-refine-ransac-threshold", type=float, default=1.5)
+    parser.add_argument("--pose-refine-ransac-max-iters", type=int, default=10000)
+    parser.add_argument("--pose-refine-max-samples", type=int, default=5000)
+    parser.add_argument("--pose-refine-homography-threshold", type=float, default=2.0)
+    parser.add_argument("--pose-refine-max-homography-dominance", type=float, default=0.95)
+    parser.add_argument("--pose-refine-max-rotation-deg", type=float, default=3.0)
+    parser.add_argument("--pose-refine-max-translation-deg", type=float, default=8.0)
+    parser.add_argument("--pose-refine-min-inliers", type=int, default=80)
+    parser.add_argument("--pose-refine-min-inlier-ratio", type=float, default=0.25)
+    parser.add_argument("--pose-refine-min-improvement", type=float, default=0.05)
+    parser.add_argument("--pose-refine-strength", type=float, default=1.0)
     parser.add_argument("--geometry-fb-threshold", type=float, default=2.0)
     parser.add_argument("--geometry-epipolar-threshold", type=float, default=2.0)
     parser.add_argument("--geometry-reprojection-threshold", type=float, default=2.0)
@@ -843,6 +894,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="learned surface to preserve; defaults to the anchor camera",
     )
     parser.add_argument("--final-depth-source", choices=("model-raw", "refined"), default="model-raw")
+    parser.add_argument(
+        "--render-mode",
+        choices=("strict", "complete"),
+        default="strict",
+        help="strict输出未填补的Z-buffer可见像素和精确mask；complete显式启用显示补全",
+    )
     parser.add_argument("--render-unresolved-max-component-area", type=int, default=512)
     parser.add_argument(
         "--render-fill-texture-method",
@@ -873,6 +930,27 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--panel-width至少为160")
     if args.model_input_size <= 0 or args.projection_max_side <= 0:
         raise PipelineError("模型和投影尺寸必须大于0")
+    if args.pose_refine_min_inliers < 8:
+        raise PipelineError("--pose-refine-min-inliers必须至少为8")
+    if args.pose_refine_max_samples < 8 or args.pose_refine_ransac_max_iters < 1:
+        raise PipelineError("单帧外参修正样本数必须至少8，RANSAC迭代必须大于0")
+    if args.pose_refine_min_inliers > args.pose_refine_max_samples:
+        raise PipelineError("单帧外参修正的最少内点数不能超过最大样本数")
+    if args.pose_refine_ransac_threshold <= 0 or args.pose_refine_homography_threshold <= 0:
+        raise PipelineError("单帧外参修正的RANSAC阈值必须大于0")
+    if not 0.0 < args.pose_refine_max_homography_dominance <= 1.5:
+        raise PipelineError("--pose-refine-max-homography-dominance必须在(0,1.5]内")
+    if not 0.0 <= args.pose_refine_min_inlier_ratio <= 1.0:
+        raise PipelineError("--pose-refine-min-inlier-ratio必须在[0,1]内")
+    if not 0.0 <= args.pose_refine_min_improvement < 1.0:
+        raise PipelineError("--pose-refine-min-improvement必须在[0,1)内")
+    if not 0.0 < args.pose_refine_strength <= 1.0:
+        raise PipelineError("--pose-refine-strength必须在(0,1]内")
+    if (
+        args.pose_refine_max_rotation_deg <= 0
+        or args.pose_refine_max_translation_deg <= 0
+    ):
+        raise PipelineError("单帧外参修正的最大漂移角必须大于0")
     if args.render_unresolved_max_component_area < 0 or args.render_inpaint_radius < 0:
         raise PipelineError("渲染组件面积和修复半径不能为负")
     unknown_priors = set(args.prior_cameras).difference(REFERENCE_CAMERAS)
@@ -1002,7 +1080,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         t0 = time.monotonic()
         try:
-            if frame_complete(frame_dir, args.reference_cameras) and not args.overwrite:
+            if (
+                frame_complete(
+                    frame_dir, args.reference_cameras, args.render_mode
+                )
+                and not args.overwrite
+            ):
                 row["status"] = "skipped_complete"
                 row["geometry_status"] = "reused"
                 row["prior_status"] = "reused"
@@ -1014,7 +1097,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"[{index}/{len(selected)}] {frame}: 已完成，跳过")
             else:
                 geometry_dir.mkdir(parents=True, exist_ok=True)
-                if geometry_complete(geometry_dir) and not args.rerun_geometry:
+                if (
+                    geometry_complete(geometry_dir, args.pose_refinement)
+                    and not args.rerun_geometry
+                ):
                     row["geometry_status"] = "reused"
                     print(f"\n[{index}/{len(selected)}] {frame}: 复用RoMa几何缓存")
                 else:
@@ -1027,7 +1113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if exit_code != 0:
                         raise PipelineError(f"几何阶段失败，exit_code={exit_code}")
                     geometry_marker.unlink(missing_ok=True)
-                    if not geometry_complete(geometry_dir):
+                    if not geometry_complete(geometry_dir, args.pose_refinement):
                         raise PipelineError("几何阶段返回成功，但报告或NPZ不完整")
                     row["geometry_status"] = "success"
                     if args.debug == "compact":
@@ -1061,6 +1147,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     diagnostics_dir / f"{name}_overlay_50.jpg"
                     for name in args.reference_cameras
                 )
+                required_prior.extend(
+                    diagnostics_dir / f"{name}_valid_mask.png"
+                    for name in args.reference_cameras
+                )
                 if exit_code != 0 or not all(path.is_file() for path in required_prior):
                     raise PipelineError(f"深度先验阶段失败或输出不完整，exit_code={exit_code}")
                 row["prior_status"] = "success"
@@ -1085,6 +1175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 frame_report = {
                     "schema": "multialign_end_to_end_frame_v2",
                     "status": "success",
+                    "render_mode": args.render_mode,
                     "frame": frame,
                     "scene_id": row["scene_id"],
                     "variant": row["variant"],
@@ -1108,9 +1199,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "anchor_unresolved_pct": unresolved,
                     "visuals": visuals,
                     "methods": {
-                        "geometry": "RoMa correspondences + fixed calibration + epipolar/triangulation gates",
+                        "geometry": (
+                            "RoMa correspondences + global calibration"
+                            + (
+                                " + guarded per-frame essential-pose refinement"
+                                if args.pose_refinement == "essential"
+                                else ""
+                            )
+                            + " + epipolar/triangulation gates"
+                        ),
                         "depth": "Depth Anything V2 relative depth anchored by reliable calibrated geometry",
-                        "render": "model-raw reference lock + one-pass reference-to-target reprojection + z-buffer + same-surface fill + bounded relaxed fill + structure-continuation inpaint",
+                        "render": (
+                            "model-raw reference lock + one-pass reference-to-target "
+                            "reprojection + z-buffer + strict masked output without fill"
+                            if args.render_mode == "strict"
+                            else (
+                                "model-raw reference lock + one-pass reference-to-target "
+                                "reprojection + z-buffer + explicitly enabled bounded completion"
+                            )
+                        ),
                         "overlay": "aligned reference and target at 0.5/0.5 inside valid render support",
                     },
                     "completed_at": utc_now(),
@@ -1123,7 +1230,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.reference_cameras,
                     )
                 pipeline_marker.unlink(missing_ok=True)
-                if not frame_complete(frame_dir, args.reference_cameras):
+                if not frame_complete(
+                    frame_dir, args.reference_cameras, args.render_mode
+                ):
                     raise PipelineError("最终质量检查失败：必要文件缺失")
                 row["status"] = "success"
                 print(

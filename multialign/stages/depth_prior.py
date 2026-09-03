@@ -100,7 +100,7 @@ class DepthCandidate:
 
 @dataclass
 class ReferenceRender:
-    """Both conservative and visually complete reference-to-target renders."""
+    """Visibility masks and optional completion for one target-grid render."""
 
     aligned_complete: np.ndarray
     aligned_surface_copy: np.ndarray
@@ -409,7 +409,14 @@ def project_points(
 
 def load_geometry_npz(
     path: Path, target_size: tuple[int, int], mask_mode: str, erode: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    dict[str, Any],
+]:
     if not path.is_file():
         raise PriorAlignmentError(f"几何NPZ不存在：{path}")
     with np.load(path, allow_pickle=False) as data:
@@ -450,6 +457,22 @@ def load_geometry_npz(
             if support_key
             else np.ones(depth.shape, dtype=np.float32)
         )
+        pose_overrides: dict[str, np.ndarray] = {}
+        for camera in REFERENCE_NAMES:
+            key = f"reference_from_target__{camera}"
+            if key not in keys:
+                continue
+            matrix = np.asarray(data[key], dtype=np.float64)
+            if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+                raise PriorAlignmentError(f"几何NPZ中的{key}不是有限4x4矩阵")
+            rotation = matrix[:3, :3]
+            if (
+                np.linalg.norm(rotation.T @ rotation - np.eye(3)) > 1e-2
+                or abs(float(np.linalg.det(rotation)) - 1.0) > 1e-2
+                or np.linalg.norm(matrix[3] - np.array([0.0, 0.0, 0.0, 1.0])) > 1e-6
+            ):
+                raise PriorAlignmentError(f"几何NPZ中的{key}不是有效刚体变换")
+            pose_overrides[camera] = matrix
 
     target_shape = (target_size[1], target_size[0])
     if depth.shape != target_shape:
@@ -474,10 +497,11 @@ def load_geometry_npz(
         "mask_key": selected_key,
         "confidence_key": confidence_key,
         "support_key": support_key,
+        "pose_override_cameras": sorted(pose_overrides),
         "anchor_pixels": int(np.count_nonzero(mask)),
         "depth_quantiles": quantiles(depth[mask]),
     }
-    return depth, mask, confidence, support, report
+    return depth, mask, confidence, support, pose_overrides, report
 
 
 class DepthAnythingRunner:
@@ -3071,7 +3095,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Depth Anything V2 dense priors + calibrated multi-camera geometry "
-            "+ reprojection into an unknown-intrinsics target camera"
+            "+ reprojection into the target camera grid"
         )
     )
     parser.add_argument("--reference-cameras", nargs="+", required=True)
@@ -3150,6 +3174,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--row-chunk", type=int, default=64)
     parser.add_argument("--zbuffer-tolerance", type=float, default=0.005)
     parser.add_argument("--occlusion-tolerance", type=float, default=0.01)
+    parser.add_argument(
+        "--render-mode",
+        choices=("strict", "complete"),
+        default="strict",
+        help=(
+            "strict仅输出Z-buffer可见的真实采样像素及其二值mask，不补遮挡；"
+            "complete显式启用旧的有界显示补全"
+        ),
+    )
     parser.add_argument(
         "--render-occlusion-fill-radius", type=int, default=24,
         help="Z-buffer拒绝后，沿相同目标深度表面补全窄遮挡带的最大半径；0关闭",
@@ -3417,9 +3450,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_size,
         args.invert_legacy_poses,
     )
-    geometry_depth, geometry_mask, geometry_confidence, geometry_support, geometry_report = load_geometry_npz(
+    (
+        geometry_depth,
+        geometry_mask,
+        geometry_confidence,
+        geometry_support,
+        frame_pose_overrides,
+        geometry_report,
+    ) = load_geometry_npz(
         args.geometry_npz.resolve(), target_size, args.geometry_mask, args.anchor_erode
     )
+    for name, reference_from_target in frame_pose_overrides.items():
+        camera = reference_models[name]
+        reference_models[name] = CameraModel(
+            camera.name,
+            camera.K,
+            camera.dist,
+            camera.image_size,
+            reference_from_target @ target_model.pose_from_master,
+        )
 
     target = resize_target(target_native, target_size)
     target_gray = robust_uint8(to_gray(target), clahe=True)
@@ -3721,18 +3770,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.final_depth_source == "refined" and np.any(segmentation_changed)
     )
     segmentation_report["final_depth_source"] = args.final_depth_source
-    (
-        render_depth,
-        render_complete,
-        render_surface_guide_depth,
-        render_surface_guide_filled,
-    ) = build_render_surface_guide(
-        final_depth,
-        final_complete,
-        args.render_surface_guide_fill_radius,
-        args.render_surface_guide_median_radius,
-        args.render_surface_depth_tolerance,
-    )
+    if args.render_mode == "strict":
+        # The primary render must be backed only by the strict multi-view depth
+        # support.  Keep invalid depths as NaN so no downstream operation can
+        # accidentally treat an unmasked completed depth as an observation.
+        render_complete = final_strict.copy()
+        render_depth = np.where(
+            render_complete, strict_source_depth, np.nan
+        ).astype(np.float32)
+        render_surface_guide_depth = render_depth.copy()
+        render_surface_guide_filled = np.zeros(render_complete.shape, dtype=bool)
+    else:
+        (
+            render_depth,
+            render_complete,
+            render_surface_guide_depth,
+            render_surface_guide_filled,
+        ) = build_render_surface_guide(
+            final_depth,
+            final_complete,
+            args.render_surface_guide_fill_radius,
+            args.render_surface_guide_median_radius,
+            args.render_surface_depth_tolerance,
+        )
     print(
         f"最终深度来源={args.final_depth_source}；"
         + (
@@ -3741,12 +3801,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else "使用目标图像/SAM精修候选"
         )
     )
-    print(
-        f"渲染表面引导补孔="
-        f"{100*np.count_nonzero(render_surface_guide_filled)/render_surface_guide_filled.size:.2f}%；"
-        f"中值半径={args.render_surface_guide_median_radius}px；"
-        "只影响完整显示，不改最终/严格深度"
-    )
+    if args.render_mode == "strict":
+        print("渲染模式=strict；不补遮挡/孔洞，主图只保留Z-buffer可见像素并输出精确mask")
+    else:
+        print(
+            f"渲染模式=complete；表面引导补孔="
+            f"{100*np.count_nonzero(render_surface_guide_filled)/render_surface_guide_filled.size:.2f}%；"
+            f"中值半径={args.render_surface_guide_median_radius}px；"
+            "只影响完整显示，不改最终/严格深度"
+        )
     print(
         f"\n严格深度覆盖={100*np.count_nonzero(final_strict)/final_strict.size:.2f}%；"
         f"完整先验覆盖={100*np.count_nonzero(final_complete)/final_complete.size:.2f}%；"
@@ -3895,40 +3958,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     rendering_report: dict[str, Any] = {}
     for name in REFERENCE_NAMES:
-        rendered = render_reference(
-            references[name], reference_models[name], target_model, target_rays,
-            render_depth, render_complete, render_surface_guide_depth,
-            args.render_interpolation,
-            args.render_edge_depth_step,
-            args.render_edge_nearest_radius,
-            args.occlusion_tolerance,
-            args.render_occlusion_fill_radius,
-            args.render_surface_depth_tolerance,
-            args.render_unresolved_relaxed_depth_tolerance,
-            args.render_unresolved_max_component_area,
-            args.render_crack_radius, args.fill_relative_spread,
-            args.edge_crack_policy,
-            args.render_fill_texture_method,
-            args.render_inpaint_radius,
-        )
-        strict_rendered = render_reference(
-            references[name], reference_models[name], target_model, target_rays,
-            strict_source_depth, final_complete, strict_source_depth,
-            args.render_interpolation,
-            args.render_edge_depth_step,
-            args.render_edge_nearest_radius,
-            args.occlusion_tolerance,
-            0,
-            args.render_surface_depth_tolerance,
-            args.render_unresolved_relaxed_depth_tolerance,
-            0,
-            0, args.fill_relative_spread, args.edge_crack_policy,
-            "copy",
-            0.0,
-        )
+        if args.render_mode == "complete":
+            rendered = render_reference(
+                references[name], reference_models[name], target_model, target_rays,
+                render_depth, render_complete, render_surface_guide_depth,
+                args.render_interpolation,
+                args.render_edge_depth_step,
+                args.render_edge_nearest_radius,
+                args.occlusion_tolerance,
+                args.render_occlusion_fill_radius,
+                args.render_surface_depth_tolerance,
+                args.render_unresolved_relaxed_depth_tolerance,
+                args.render_unresolved_max_component_area,
+                args.render_crack_radius, args.fill_relative_spread,
+                args.edge_crack_policy,
+                args.render_fill_texture_method,
+                args.render_inpaint_radius,
+            )
+            strict_rendered = render_reference(
+                references[name], reference_models[name], target_model, target_rays,
+                strict_source_depth, final_strict, strict_source_depth,
+                args.render_interpolation,
+                args.render_edge_depth_step,
+                args.render_edge_nearest_radius,
+                args.occlusion_tolerance,
+                0,
+                args.render_surface_depth_tolerance,
+                args.render_unresolved_relaxed_depth_tolerance,
+                0,
+                0, args.fill_relative_spread, args.edge_crack_policy,
+                "copy",
+                0.0,
+            )
+        else:
+            # Disable every completion path, including display-crack filling
+            # and texture inpainting.  This is also the only render performed
+            # in strict mode, so no fabricated image is produced and discarded.
+            rendered = render_reference(
+                references[name], reference_models[name], target_model, target_rays,
+                render_depth, render_complete, render_surface_guide_depth,
+                args.render_interpolation,
+                args.render_edge_depth_step,
+                args.render_edge_nearest_radius,
+                args.occlusion_tolerance,
+                0,
+                args.render_surface_depth_tolerance,
+                args.render_unresolved_relaxed_depth_tolerance,
+                0,
+                0, args.fill_relative_spread, args.edge_crack_policy,
+                "copy",
+                0.0,
+            )
+            strict_rendered = rendered
         strict_visible = strict_rendered.zbuffer_visible & final_strict
         aligned_strict = strict_rendered.aligned_zbuffer.copy()
         aligned_strict[~strict_visible] = 0
+        primary_aligned = (
+            aligned_strict
+            if args.render_mode == "strict"
+            else rendered.aligned_complete
+        )
+        primary_valid = (
+            strict_visible
+            if args.render_mode == "strict"
+            else rendered.visual_mask
+        )
+        # Enforce the file contract even if a future renderer changes its
+        # internal handling of invalid pixels.
+        primary_aligned = primary_aligned.copy()
+        primary_aligned[~primary_valid] = 0
         occlusion_ambiguous = rendered.sampleable & ~rendered.zbuffer_visible
         occlusion_unresolved = (
             occlusion_ambiguous
@@ -3936,11 +4034,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             & ~rendered.occlusion_relaxed_filled
         )
         overlay = alpha_overlay(
-            rendered.aligned_complete, target, rendered.visual_mask, args.overlay_alpha
+            primary_aligned, target, primary_valid, args.overlay_alpha
         )
-        edges = edge_overlay(rendered.aligned_complete, target, rendered.visual_mask)
-        write_image(output_dir / f"{name}_aligned.jpg", rendered.aligned_complete)
-        write_image(output_dir / f"{name}_aligned.png", rendered.aligned_complete)
+        edges = edge_overlay(primary_aligned, target, primary_valid)
+        write_image(output_dir / f"{name}_aligned.jpg", primary_aligned)
+        write_image(output_dir / f"{name}_aligned.png", primary_aligned)
         write_image(
             output_dir / f"{name}_aligned_surface_copy.png",
             rendered.aligned_surface_copy,
@@ -3950,7 +4048,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rendered.aligned_raw_sampleable,
         )
         write_image(output_dir / f"{name}_aligned_strict.jpg", aligned_strict)
-        write_image(output_dir / f"{name}_valid_mask.png", rendered.sampleable.astype(np.uint8) * 255)
+        write_image(output_dir / f"{name}_valid_mask.png", primary_valid.astype(np.uint8) * 255)
         write_image(output_dir / f"{name}_strict_mask.png", strict_visible.astype(np.uint8) * 255)
         write_image(
             output_dir / f"{name}_zbuffer_visible_mask.png",
@@ -4010,6 +4108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         maps[f"{name}_occlusion_relaxed_filled_mask"] = rendered.occlusion_relaxed_filled.astype(np.uint8)
         maps[f"{name}_occlusion_unresolved_mask"] = occlusion_unresolved.astype(np.uint8)
         maps[f"{name}_visible_mask"] = strict_visible.astype(np.uint8)
+        maps[f"{name}_valid_mask"] = primary_valid.astype(np.uint8)
         maps[f"{name}_display_filled_mask"] = rendered.display_filled.astype(np.uint8)
         maps[f"{name}_texture_structure_refined_mask"] = (
             rendered.texture_structure_refined.astype(np.uint8)
@@ -4019,6 +4118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         maps[f"{name}_edge_nearest_mask"] = rendered.edge_nearest_mask.astype(np.uint8)
         rendering_report[name] = {
+            "mode": args.render_mode,
+            "primary_valid_ratio": float(
+                np.count_nonzero(primary_valid) / primary_valid.size
+            ),
             "sampleable_ratio": float(
                 np.count_nonzero(rendered.sampleable) / rendered.sampleable.size
             ),
@@ -4060,42 +4163,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                 np.count_nonzero(rendered.edge_nearest_mask) / rendered.edge_nearest_mask.size
             ),
         }
-        print(
-            f"[{name}] 完整输出覆盖="
-            f"{100*np.count_nonzero(rendered.visual_mask)/rendered.visual_mask.size:.2f}%；"
-            f"严格可见={100*np.count_nonzero(strict_visible)/strict_visible.size:.2f}%；"
-            f"遮挡带同层补全={100*np.count_nonzero(rendered.occlusion_filled)/rendered.occlusion_filled.size:.2f}%；"
-            f"小组件放宽补全={100*np.count_nonzero(rendered.occlusion_relaxed_filled)/rendered.occlusion_relaxed_filled.size:.2f}%；"
-            f"纹理方向修复={100*np.count_nonzero(rendered.texture_structure_refined)/rendered.texture_structure_refined.size:.2f}%；"
-            f"锐利边界采样={100*np.count_nonzero(rendered.edge_nearest_mask)/rendered.edge_nearest_mask.size:.2f}%；"
-            f"仍未解决={100*np.count_nonzero(occlusion_unresolved)/occlusion_unresolved.size:.2f}%"
-        )
+        if args.render_mode == "strict":
+            print(
+                f"[{name}] 主输出有效="
+                f"{100*np.count_nonzero(primary_valid)/primary_valid.size:.2f}%；"
+                "遮挡补全=0.00%；纹理修复=0.00%；"
+                f"Z-buffer拒绝={100*np.count_nonzero(occlusion_ambiguous)/occlusion_ambiguous.size:.2f}%"
+            )
+        else:
+            print(
+                f"[{name}] 完整输出覆盖="
+                f"{100*np.count_nonzero(rendered.visual_mask)/rendered.visual_mask.size:.2f}%；"
+                f"严格可见={100*np.count_nonzero(strict_visible)/strict_visible.size:.2f}%；"
+                f"遮挡带同层补全={100*np.count_nonzero(rendered.occlusion_filled)/rendered.occlusion_filled.size:.2f}%；"
+                f"小组件放宽补全={100*np.count_nonzero(rendered.occlusion_relaxed_filled)/rendered.occlusion_relaxed_filled.size:.2f}%；"
+                f"纹理方向修复={100*np.count_nonzero(rendered.texture_structure_refined)/rendered.texture_structure_refined.size:.2f}%；"
+                f"锐利边界采样={100*np.count_nonzero(rendered.edge_nearest_mask)/rendered.edge_nearest_mask.size:.2f}%；"
+                f"仍未解决={100*np.count_nonzero(occlusion_unresolved)/occlusion_unresolved.size:.2f}%"
+            )
 
     np.savez_compressed(output_dir / "depth_prior_alignment_maps.npz", **maps)
+    if args.render_mode == "strict":
+        render_method = (
+            "Depth Anything V2 surfaces -> calibrated scale/shift -> strict "
+            "multi-view depth support -> edge-aware target-grid remap -> "
+            "Z-buffer visibility -> masked output (no completion or inpainting)"
+        )
+        render_note = (
+            "Primary *_aligned.png files contain only pixels supported by the "
+            "strict depth mask and accepted by Z-buffer visibility. Occluded, "
+            "out-of-field, and unsupported pixels are zero, and "
+            "*_valid_mask.png is the exact binary validity mask for the primary "
+            "PNG. No occlusion propagation, display-crack filling, or texture "
+            "inpainting is executed in strict mode."
+        )
+    else:
+        render_method = (
+            "Depth Anything V2 surfaces -> calibrated scale/shift -> render-only "
+            "surface guide -> edge-aware target-grid remap -> Z-buffer rejection "
+            "-> bounded same-surface completion -> optional texture restoration"
+        )
+        render_note = (
+            "Complete mode is an explicit compatibility option. Its primary "
+            "*_aligned.png files may contain pixels authorized by the reported "
+            "completion masks; *_valid_mask.png still exactly identifies every "
+            "pixel present in the primary PNG. The separate strict masks remain "
+            "available for measurement."
+        )
     report = {
-        "schema": "multialign_model_first_calibrated_depth_v14_structure_continuation_inpaint",
-        "method": "Depth Anything V2 surfaces -> calibrated scale/shift -> hard reference-surface lock -> bounded render-only depth-hole completion -> median-cleaned surface guide -> edge-aware texture remap -> z-buffer rejection -> strict same-surface fill -> relaxed fill for small non-border unresolved components -> geometry-authorized structure-continuation texture restoration -> separate strict render",
+        "schema": "multialign_model_first_calibrated_depth_v15_masked_render",
+        "method": render_method,
         "important": (
             "The learned model defines local depth variation and object boundaries. Calibrated triangulation only "
             "fits model scale/shift, selects among conflicting learned surfaces, and changes confidence; it never "
             "overwrites final model depth values. In model-raw mode the reference model is reasserted at every valid "
             "reference pixel, so another reference, geometry, target snapping, or SAM cannot alternate a thin object "
             "between near and far surfaces; other references fill only missing reference pixels. The old raw backward "
-            "warp is saved as *_aligned_raw_sampleable.jpg "
-            "for diagnosis only because it can widen a pole or duplicate a coloured sign at occlusions. The default "
-            "texture remap uses bilinear interpolation inside surfaces but nearest-neighbour sampling in a narrow "
-            "target-depth edge band, preventing foreground/background colour averaging. *_aligned.jpg then rejects "
-            "z-buffer conflicts and fills only from neighbours on the same target-depth "
-            "surface. The edge-nearest mask is an interpolation diagnostic, not a hole-fill mask. Small holes and "
-            "fragmented depth lines are repaired in a separate render-only surface guide and never written back to "
-            "the metric or strict depth. Remaining small non-border occlusion components receive a second pass with "
-            "a relaxed depth tolerance; large or border-touching disocclusions remain unresolved rather than being "
-            "fabricated. The default Navier-Stokes texture stage then continues isophote/edge direction only inside "
-            "pixels already authorized by one of the geometric fill masks; original valid pixels and unresolved "
-            "regions are copied back unchanged. *_aligned_surface_copy.png preserves the pre-inpaint result for A/B "
-            "diagnosis, while *_texture_structure_refined_mask.png shows the exact committed region. Prompted masks "
-            "may represent either a near object or a far opening; "
-            "rejected proposals fall back safely."
+            "warp is saved as *_aligned_raw_sampleable.jpg for diagnosis only because it can widen a pole or "
+            "duplicate a coloured sign at occlusions. The texture remap uses bilinear interpolation inside surfaces "
+            "but nearest-neighbour sampling in a narrow target-depth edge band, preventing foreground/background "
+            "colour averaging. The edge-nearest mask is an interpolation diagnostic, not a hole-fill mask. "
+            + render_note
         ),
         "inputs": {
             "calibration": str(args.calibration.resolve()),
@@ -4163,17 +4291,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\n完成：{output_dir}")
     print(f"最终深度与映射：{output_dir / 'depth_prior_alignment_maps.npz'}")
     print(f"透明叠加：{output_dir / f'{example_reference}_overlay_50.jpg'} 等")
-    print(
-        "纹理补全A/B："
-        f"{output_dir / f'{example_reference}_aligned_surface_copy.png'}（旧式复制）与 "
-        f"{output_dir / f'{example_reference}_aligned.png'}（结构延续）"
-    )
+    if args.render_mode == "complete":
+        print(
+            "纹理补全A/B："
+            f"{output_dir / f'{example_reference}_aligned_surface_copy.png'}（旧式复制）与 "
+            f"{output_dir / f'{example_reference}_aligned.png'}（结构延续）"
+        )
     print(
         "深度A/B："
         f"{output_dir / 'depth_final_model_raw.png'} 与 "
         f"{output_dir / 'depth_final_refined_candidate.png'}"
     )
-    print("完整观看使用*_aligned.jpg；定量分析使用*_aligned_strict.jpg和*_strict_mask.png。")
+    if args.render_mode == "strict":
+        print("主结果使用*_aligned.png及对应*_valid_mask.png；遮挡与无支持区域未填补。")
+    else:
+        print("完整观看使用*_aligned.png；定量分析使用*_aligned_strict.jpg和*_strict_mask.png。")
     return 0
 
 

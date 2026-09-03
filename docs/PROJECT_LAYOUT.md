@@ -15,6 +15,17 @@ same command line.
     "target_camera": "camera_target",
     "anchor_camera": "camera_left",
     "scale_reference_camera": "camera_right"
+  },
+  "calibration": {
+    "reference_intrinsics": "auto",
+    "target_model": "auto",
+    "reference_distortion": "fixed",
+    "target_distortion": "fixed",
+    "rig_motion_model": "fixed"
+  },
+  "alignment": {
+    "render_mode": "strict",
+    "pose_refinement": "off"
   }
 }
 ```
@@ -60,8 +71,23 @@ The initial calibration format is:
 }
 ```
 
-All reference entries must contain measured intrinsics. The target `K` is an
-optimization seed, not a claim that the target intrinsics are known.
+Measured `K` values use numeric `image_size` and matrices as above. An unknown
+camera may instead use the following weak-seed form:
+
+```json
+{
+  "intrinsics_known": false,
+  "image_size": "auto",
+  "K": "auto",
+  "focal_length_35mm": 23.0,
+  "principal_point_fraction": [0.5, 0.5],
+  "dist": [0, 0, 0, 0, 0]
+}
+```
+
+`focal_ratio` may replace `focal_length_35mm`; it multiplies the larger image
+dimension. Both forms are optimization seeds, not claims that the intrinsics
+are measured.
 
 ## Stage handoffs
 
@@ -107,6 +133,11 @@ C_anchor = -R.T @ T
 Without a measured baseline, translation uses a normalized gauge. With
 `--scale-baseline-mm`, the translation unit is millimetres.
 
+When per-frame pose refinement is accepted, the geometry NPZ also stores one
+`reference_from_target__CAMERA` 4x4 transform per reference. These transforms
+retain the nominal baseline scale and override only that frame's relative pose
+in depth anchoring and rendering.
+
 ## Alignment run
 
 ```text
@@ -144,7 +175,7 @@ runs/alignment/
 | Need | File |
 |---|---|
 | Lossless aligned image | `results/CAMERA_aligned.png` |
-| Valid sampling support | `results/CAMERA_valid_mask.png` |
+| Exact valid visible mask (255 valid, 0 invalid) | `results/CAMERA_valid_mask.png` |
 | Human alignment check | `results/CAMERA_overlay_50.jpg` |
 | Dynamic contact sheet | `results/overview.png` |
 | Dense target depth preview | `results/target_depth.png` |
@@ -154,8 +185,8 @@ runs/alignment/
 | Batch status | `batch_summary.csv` or `batch_summary.json` |
 
 The overview is a preview. It automatically changes row/column count as
-reference cameras are added. The individual aligned PNG files are the lossless
-results.
+reference cameras are added. In the default strict mode, each lossless aligned
+PNG is zero outside its exact `CAMERA_valid_mask.png`; occlusions are not filled.
 
 ## Resume behavior
 

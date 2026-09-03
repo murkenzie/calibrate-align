@@ -58,6 +58,19 @@ class AlignmentOutputTests(unittest.TestCase):
                     (results / f"{camera}_{suffix}").write_bytes(b"placeholder")
             self.assertTrue(self.alignment.frame_complete(frame, references))
 
+    def test_geometry_cache_tracks_pose_refinement_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "depth_alignment_maps.npz").write_bytes(b"placeholder")
+            (directory / "alignment_report.json").write_text(
+                json.dumps({"settings": {"pose_refinement": "essential"}}),
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                self.alignment.geometry_complete(directory, "essential")
+            )
+            self.assertFalse(self.alignment.geometry_complete(directory, "off"))
+
     def test_high_level_alignment_dry_run_uses_dynamic_roles(self) -> None:
         references = ("left", "right", "top")
         with tempfile.TemporaryDirectory() as temporary:
@@ -67,6 +80,7 @@ class AlignmentOutputTests(unittest.TestCase):
                 "target",
                 "left",
                 "right",
+                allow_pose_drift=True,
             )
             paths.final_calibration.parent.mkdir(parents=True, exist_ok=True)
             paths.final_calibration.write_text(
@@ -86,6 +100,8 @@ class AlignmentOutputTests(unittest.TestCase):
             self.assertEqual(
                 summary["camera_roles"]["reference_cameras"], list(references)
             )
+            self.assertEqual(summary["settings"]["pose_refinement"], "essential")
+            self.assertEqual(summary["settings"]["render_mode"], "strict")
 
 
 if __name__ == "__main__":

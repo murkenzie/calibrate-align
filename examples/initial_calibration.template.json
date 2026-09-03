@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "example_only": true,
-  "warning": "Replace all anonymous example values before use. Reference intrinsics must be measured; target K is only an optimization seed.",
+  "warning": "Replace all anonymous example values before use. Set intrinsics_known=false and K=auto when a camera has only a rough seed.",
   "cameras": {
     "camera_left": {
       "intrinsics_known": true,

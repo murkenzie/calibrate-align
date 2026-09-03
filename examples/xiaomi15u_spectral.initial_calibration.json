@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "example_only": true,
+  "warning": "Review the lens-to-directory mapping, then set example_only=false. These are weak seeds, not measured intrinsics.",
+  "cameras": {
+    "main": {
+      "intrinsics_known": false,
+      "image_size": "auto",
+      "K": "auto",
+      "focal_length_35mm": 23.0,
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "wide": {
+      "intrinsics_known": false,
+      "image_size": "auto",
+      "K": "auto",
+      "focal_length_35mm": 14.0,
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "tele": {
+      "intrinsics_known": false,
+      "image_size": "auto",
+      "K": "auto",
+      "focal_length_35mm": 70.0,
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "supertele": {
+      "intrinsics_known": false,
+      "image_size": "auto",
+      "K": "auto",
+      "focal_length_35mm": 100.0,
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "spectral": {
+      "intrinsics_known": false,
+      "image_size": "auto",
+      "K": "auto",
+      "focal_ratio": 1.0,
+      "dist": [0.0, 0.0, 0.0, 0.0, 0.0],
+      "note": "focal_ratio means focal pixels / max(image width, image height); replace 1.0 with the best available estimate."
+    }
+  }
+}

@@ -88,14 +88,51 @@ def default_config(
             "precision": "auto",
             "allow_cpu": False,
         },
+        "calibration": {
+            "reference_intrinsics": "auto",
+            "target_model": "auto",
+            "reference_distortion": "fixed",
+            "target_distortion": "fixed",
+            "rig_motion_model": "fixed",
+        },
+        "alignment": {
+            "render_mode": "strict",
+            "pose_refinement": "off",
+            "pose_refine_ransac_threshold": 1.5,
+            "pose_refine_ransac_max_iters": 10000,
+            "pose_refine_max_samples": 5000,
+            "pose_refine_homography_threshold": 2.0,
+            "pose_refine_max_homography_dominance": 0.95,
+            "pose_refine_max_rotation_deg": 3.0,
+            "pose_refine_max_translation_deg": 8.0,
+            "pose_refine_min_inliers": 80,
+            "pose_refine_min_inlier_ratio": 0.25,
+            "pose_refine_min_improvement": 0.05,
+            "pose_refine_strength": 1.0,
+        },
     }
 
 
 def initial_calibration_template(
-    reference_cameras: Sequence[str], target_camera: str
+    reference_cameras: Sequence[str],
+    target_camera: str,
+    all_intrinsics_unknown: bool = False,
 ) -> dict[str, Any]:
     cameras: dict[str, Any] = {}
     for index, name in enumerate(reference_cameras):
+        if all_intrinsics_unknown:
+            cameras[name] = {
+                "intrinsics_known": False,
+                "image_size": "auto",
+                "K": "auto",
+                "focal_ratio": 1.0,
+                "dist": [0.0] * 5,
+                "note": (
+                    "Replace focal_ratio with focal_length_35mm when EXIF is "
+                    "available. K and image_size are inferred from matched images."
+                ),
+            }
+            continue
         focal = 900.0 + 150.0 * index
         cameras[name] = {
             "intrinsics_known": True,
@@ -107,23 +144,37 @@ def initial_calibration_template(
             ],
             "dist": [0.0] * 5,
         }
-    cameras[target_camera] = {
-        "intrinsics_known": False,
-        "image_size": [1000, 750],
-        "K": [
-            [1000.0, 0.0, 500.0],
-            [0.0, 1000.0, 375.0],
-            [0.0, 0.0, 1.0],
-        ],
-        "dist": [0.0] * 5,
-        "note": "K is an optimization seed, not a known calibration.",
-    }
+    if all_intrinsics_unknown:
+        cameras[target_camera] = {
+            "intrinsics_known": False,
+            "image_size": "auto",
+            "K": "auto",
+            "focal_ratio": 1.0,
+            "dist": [0.0] * 5,
+            "note": "K and image_size are inferred; focal_ratio is only a weak seed.",
+        }
+    else:
+        cameras[target_camera] = {
+            "intrinsics_known": False,
+            "image_size": [1000, 750],
+            "K": [
+                [1000.0, 0.0, 500.0],
+                [0.0, 1000.0, 375.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "dist": [0.0] * 5,
+            "note": "K is an optimization seed, not a known calibration.",
+        }
     return {
         "schema_version": 1,
         "example_only": True,
         "warning": (
-            "Replace every reference camera image_size/K/dist value with its real "
-            "intrinsics. Replace the target image_size and provide a reasonable K seed."
+            "All K values are weak seeds; add focal_length_35mm when available."
+            if all_intrinsics_unknown
+            else (
+                "Replace every reference camera image_size/K/dist value with its real "
+                "intrinsics. Replace the target image_size and provide a reasonable K seed."
+            )
         ),
         "cameras": cameras,
     }
@@ -292,6 +343,8 @@ def init_project(
     target_camera: str = DEFAULT_TARGET_CAMERA,
     anchor_camera: str | None = None,
     scale_reference_camera: str | None = None,
+    all_intrinsics_unknown: bool = False,
+    allow_pose_drift: bool = False,
 ) -> tuple[ProjectPaths, tuple[Path, ...]]:
     root = project.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -304,6 +357,14 @@ def init_project(
             anchor_camera,
             scale_reference_camera,
         )
+        if all_intrinsics_unknown:
+            config["calibration"]["reference_intrinsics"] = "weak"
+            config["calibration"]["target_model"] = "focal-pp"
+            config["calibration"]["reference_distortion"] = "auto"
+            config["calibration"]["target_distortion"] = "auto"
+        if allow_pose_drift:
+            config["calibration"]["rig_motion_model"] = "small-drift"
+            config["alignment"]["pose_refinement"] = "essential"
         _write_json_atomic(config_path, config)
         created.append(config_path)
     paths = load_project(root)
@@ -316,7 +377,11 @@ def init_project(
     if not paths.initial_calibration.exists():
         _write_json_atomic(
             paths.initial_calibration,
-            initial_calibration_template(paths.reference_cameras, paths.target_camera),
+            initial_calibration_template(
+                paths.reference_cameras,
+                paths.target_camera,
+                all_intrinsics_unknown=all_intrinsics_unknown,
+            ),
         )
         created.append(paths.initial_calibration)
     gitignore = root / ".gitignore"

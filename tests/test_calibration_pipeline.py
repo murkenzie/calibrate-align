@@ -85,6 +85,42 @@ class CalibrationPipelineTests(unittest.TestCase):
             result = cli.main(["calibrate", str(paths.root), "--dry-run"])
             self.assertEqual(result, 0)
 
+    def test_unknown_intrinsics_profile_reaches_calibrator(self) -> None:
+        references = ("main", "wide")
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, _ = init_project(
+                Path(temporary) / "project",
+                references,
+                "spectral",
+                "main",
+                "wide",
+                all_intrinsics_unknown=True,
+                allow_pose_drift=True,
+            )
+            initial = json.loads(paths.initial_calibration.read_text(encoding="utf-8"))
+            initial["example_only"] = False
+            paths.initial_calibration.write_text(
+                json.dumps(initial), encoding="utf-8"
+            )
+            for camera in (*references, "spectral"):
+                (paths.calibration_images / camera / "frame_001.jpg").write_bytes(
+                    b"placeholder"
+                )
+            result = cli.main(["calibrate", str(paths.root), "--dry-run"])
+            self.assertEqual(result, 0)
+            report = json.loads(
+                (paths.calibration_run / "pipeline_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            command = report["calibration_command"]
+            self.assertEqual(
+                command[command.index("--reference-intrinsics") + 1], "weak"
+            )
+            self.assertEqual(
+                command[command.index("--rig-motion-model") + 1], "small-drift"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

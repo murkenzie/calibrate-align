@@ -1,5 +1,5 @@
-"""Generic fixed-rig calibration and unknown-intrinsics target alignment."""
+"""Multi-camera alignment from known or weakly seeded intrinsics."""
 
 __all__ = ["__version__"]
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

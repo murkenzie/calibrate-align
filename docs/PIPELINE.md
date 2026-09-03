@@ -30,7 +30,8 @@ The stage then:
 
 1. balances samples over both image grids;
 2. fits a robust fundamental matrix independently per capture;
-3. fits one shared fundamental matrix for the fixed rig;
+3. fits one shared fundamental matrix for the nominal rig (with a wider
+   diagnostic gate when small drift is enabled);
 4. evaluates it on held-out captures;
 5. reports homography dominance to expose planar or low-parallax data.
 
@@ -38,11 +39,14 @@ Only sparse correspondences are saved. RoMa flow is not a final image warp.
 
 ## 3. Jointly calibrate the rig
 
-The optimizer creates a shared pose graph across all cameras:
+The optimizer creates a shared nominal pose graph across all cameras:
 
 - the anchor reference is the identity pose;
-- known reference intrinsics are fixed by default;
-- target focal length and principal point are optimized within bounded priors;
+- measured reference intrinsics can remain fixed;
+- rough reference focal lengths and principal points can be jointly refined
+  within broad but explicit bounds and weak priors;
+- target focal length and principal point are fixed or optimized according to
+  its policy;
 - distortion freedom is selected from actual observed image radius;
 - rotations, camera centres, and allowed intrinsics are refined with a robust
   loss;
@@ -55,18 +59,30 @@ than assuming a specific rig size.
 
 The optimizer writes `rig_calibration.json`. Alignment accepts it only when
 `accepted_for_use` is true unless a diagnostic override is explicitly requested.
+Weak-intrinsics stages additionally report a Jacobian condition number and are
+rejected when the local parameterization is ill-conditioned. A low epipolar
+error alone does not prove that the recovered common focal scale is physically
+correct, so held-out geometric validation remains mandatory.
 
 ## 4. Estimate strict target-view geometry
 
 For each scene frame:
 
-1. intrinsics and fixed poses generate coarse reference-to-target hypotheses;
+1. intrinsics and nominal poses generate coarse reference-to-target hypotheses;
 2. RoMa proposes reference/target correspondences;
-3. forward/backward, epipolar, reprojection, and triangulation-angle gates remove
+3. optional per-frame essential geometry proposes a small relative-pose update;
+4. inlier count, homography dominance, maximum drift, and epipolar-improvement
+   gates either accept that update or fall back to the nominal pose;
+5. forward/backward, epipolar, reprojection, and triangulation-angle gates remove
    inconsistent points;
-4. each reference independently produces a target-grid depth candidate;
-5. multi-view consistency and confidence fuse the candidates;
-6. Z-buffer visibility produces strict reference-to-target maps.
+6. each reference independently produces a target-grid depth candidate;
+7. multi-view consistency and confidence fuse the candidates;
+8. Z-buffer visibility produces strict reference-to-target maps.
+
+Essential geometry recovers no metric translation scale. The per-frame update
+therefore retains the nominal baseline magnitude and may change only rotation
+and translation direction. The exact accepted transform is stored in the
+geometry NPZ and reused by the depth-prior/rendering stage.
 
 Pixels without reliable geometric support remain invalid. Optional geometric
 completion is saved separately from strict measurement support.
@@ -90,17 +106,15 @@ may refine object boundaries.
 ## 6. Render once into the target grid
 
 Each original reference image is sampled once through the final calibrated
-target-to-reference map. Rendering applies:
+target-to-reference map. The default `render_mode=strict` applies target-depth
+projection, edge-aware sampling, and Z-buffer rejection, then writes only the
+accepted visible samples. Occluded, out-of-field, and unsupported pixels are
+zero and are marked invalid in the exact companion mask. No occlusion fill,
+display-crack fill, or texture inpainting runs in this mode.
 
-- target-depth projection;
-- Z-buffer rejection;
-- edge-aware interpolation;
-- same-surface fill for narrow occlusion gaps;
-- a bounded relaxed pass for small non-border components;
-- structure-continuation inpainting only inside geometrically authorized masks.
-
-Strict renders and masks remain separate from visually complete renders. Large
-disocclusions and field-of-view loss stay unresolved instead of being invented.
+`render_mode=complete` is retained only as an explicit compatibility option for
+display-oriented output. It enables the older bounded completion stages and
+reports every changed region; it is not the default measurement contract.
 
 ## 7. Package outputs
 
@@ -113,12 +127,15 @@ aligned PNG files. Only preview grids are resized and dynamically tiled.
 
 ## Assumptions and failure modes
 
-- Camera poses are rigid during both calibration and use.
+- The calibration estimates one nominal rig. During use, poses are either rigid
+  or differ only by the configured small per-frame drift bounds.
 - Captures are synchronized closely enough for the scene to be effectively
   static.
 - Calibration data spans multiple depths and useful common image area.
 - Cross-modal views retain enough common structure for matching.
 - A monocular depth prior improves density but does not replace calibrated
   geometry or make absolute scale observable.
+- Weak all-camera self-calibration is underconstrained on planar or low-parallax
+  data and needs independent held-out validation.
 - Highly repetitive texture, severe occlusion, rolling-shutter motion, planar
   data, and weak baseline can all reduce reliability.

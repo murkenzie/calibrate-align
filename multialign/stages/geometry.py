@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Depth-aware alignment of two or more references to one target camera.
 
-The checkerboard is *not* required in the scene.  It is only used beforehand
-to produce the fixed multi-camera calibration JSON.  For each real scene this
-program:
+A checkerboard is *not* required in the scene. A nominal multi-camera
+calibration may come from measured intrinsics or bounded self-calibration. For
+each real scene this program:
 
 1. builds a calibration-based coarse reference-to-target view;
 2. uses RoMa v2 only to propose cross-modal correspondences;
@@ -44,7 +44,7 @@ import numpy as np
 
 
 REFERENCE_NAMES = ("reference_a", "reference_b")
-PROGRAM_VERSION = "4.4-edge-planar-depth-completion"
+PROGRAM_VERSION = "4.5-guarded-frame-pose"
 
 
 class DepthAlignmentError(RuntimeError):
@@ -82,6 +82,7 @@ class CameraCandidate:
     coarse_image: np.ndarray
     coarse_map_xy: np.ndarray
     coarse_mask: np.ndarray
+    reference_from_target: np.ndarray
     report: dict[str, Any]
 
 
@@ -730,6 +731,315 @@ def epipolar_error_target_pixels(
     return (np.sqrt(0.5 * (d_reference * d_reference + d_target * d_target)) * target_focal).astype(np.float32)
 
 
+def rotation_angle_deg(rotation: np.ndarray) -> float:
+    value = (float(np.trace(rotation)) - 1.0) * 0.5
+    return math.degrees(math.acos(float(np.clip(value, -1.0, 1.0))))
+
+
+def vector_angle_deg(vector0: np.ndarray, vector1: np.ndarray) -> float:
+    first = np.asarray(vector0, dtype=np.float64).reshape(3)
+    second = np.asarray(vector1, dtype=np.float64).reshape(3)
+    denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+    if denominator <= 1e-12:
+        return math.inf
+    cosine = float(np.dot(first, second) / denominator)
+    return math.degrees(math.acos(float(np.clip(cosine, -1.0, 1.0))))
+
+
+def balanced_pose_samples(
+    target_xy: np.ndarray,
+    quality: np.ndarray,
+    image_size: tuple[int, int],
+    maximum: int,
+    grid_shape: tuple[int, int] = (24, 18),
+) -> np.ndarray:
+    """Select deterministic high-quality matches across the whole target grid."""
+    count = len(target_xy)
+    if count <= maximum:
+        return np.arange(count, dtype=np.int64)
+    width, height = image_size
+    columns, rows = grid_shape
+    points = np.asarray(target_xy, dtype=np.float64)
+    scores = np.asarray(quality, dtype=np.float64)
+    cell_x = np.clip(
+        (points[:, 0] * columns / max(width, 1)).astype(int), 0, columns - 1
+    )
+    cell_y = np.clip(
+        (points[:, 1] * rows / max(height, 1)).astype(int), 0, rows - 1
+    )
+    cells = cell_y * columns + cell_x
+    per_cell = max(1, int(math.ceil(maximum / (columns * rows))))
+    order = np.argsort(-np.nan_to_num(scores, nan=-np.inf), kind="stable")
+    selected: list[int] = []
+    cell_counts = np.zeros(columns * rows, dtype=np.int32)
+    for raw_index in order:
+        index = int(raw_index)
+        cell = int(cells[index])
+        if cell_counts[cell] >= per_cell:
+            continue
+        selected.append(index)
+        cell_counts[cell] += 1
+        if len(selected) >= maximum:
+            break
+    if len(selected) < maximum:
+        used = set(selected)
+        for raw_index in order:
+            index = int(raw_index)
+            if index not in used:
+                selected.append(index)
+            if len(selected) >= maximum:
+                break
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _essential_candidates(value: np.ndarray) -> list[np.ndarray]:
+    essential = np.asarray(value, dtype=np.float64)
+    if essential.shape == (3, 3):
+        return [essential]
+    if (
+        essential.ndim == 2
+        and essential.shape[1] == 3
+        and essential.shape[0] % 3 == 0
+    ):
+        return [
+            essential[index : index + 3]
+            for index in range(0, essential.shape[0], 3)
+        ]
+    return []
+
+
+def _blend_direction(
+    first: np.ndarray, second: np.ndarray, strength: float
+) -> np.ndarray:
+    # Copy because ``first`` is commonly a writable view of prior_pose[:3, 3].
+    # In-place normalization must never mutate the calibration transform.
+    a = np.asarray(first, dtype=np.float64).reshape(3).copy()
+    b = np.asarray(second, dtype=np.float64).reshape(3).copy()
+    a /= max(float(np.linalg.norm(a)), 1e-12)
+    b /= max(float(np.linalg.norm(b)), 1e-12)
+    cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    theta = math.acos(cosine)
+    if theta <= 1e-8:
+        return a
+    sine = math.sin(theta)
+    if abs(sine) <= 1e-8:
+        mixed = (1.0 - strength) * a + strength * b
+    else:
+        mixed = (
+            math.sin((1.0 - strength) * theta) / sine * a
+            + math.sin(strength * theta) / sine * b
+        )
+    return mixed / max(float(np.linalg.norm(mixed)), 1e-12)
+
+
+def refine_reference_from_target_pose(
+    target_xy_normalized: np.ndarray,
+    reference_xy_normalized: np.ndarray,
+    target_xy_pixels: np.ndarray,
+    quality: np.ndarray,
+    prior_pose: np.ndarray,
+    target_size: tuple[int, int],
+    target_focal: float,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Estimate a bounded per-frame 5-DoF essential pose around the rig pose.
+
+    Essential geometry cannot recover translation magnitude. The calibrated
+    baseline is therefore retained exactly; only rotation and translation
+    direction may change, and only after explicit quality and drift gates.
+    """
+    report: dict[str, Any] = {
+        "mode": args.pose_refinement,
+        "accepted": False,
+        "status": "disabled" if args.pose_refinement == "off" else "not_attempted",
+        "baseline_scale_policy": "retain_global_calibration_magnitude",
+    }
+    if args.pose_refinement == "off":
+        return prior_pose.copy(), report
+    if len(target_xy_normalized) < 8:
+        report["status"] = "too_few_matches"
+        return prior_pose.copy(), report
+
+    selected = balanced_pose_samples(
+        target_xy_pixels,
+        quality,
+        target_size,
+        args.pose_refine_max_samples,
+    )
+    points0 = np.asarray(target_xy_normalized, dtype=np.float64)[selected]
+    points1 = np.asarray(reference_xy_normalized, dtype=np.float64)[selected]
+    threshold_normalized = args.pose_refine_ransac_threshold / max(target_focal, 1.0)
+    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+    essential_kwargs = {
+        "focal": 1.0,
+        "pp": (0.0, 0.0),
+        "method": method,
+        "prob": 0.999,
+        "threshold": threshold_normalized,
+    }
+    try:
+        essential, ransac_mask = cv2.findEssentialMat(
+            points0,
+            points1,
+            maxIters=args.pose_refine_ransac_max_iters,
+            **essential_kwargs,
+        )
+    except (cv2.error, TypeError) as first_error:
+        # Some OpenCV Python builds expose an overload without ``maxIters``.
+        try:
+            essential, ransac_mask = cv2.findEssentialMat(
+                points0,
+                points1,
+                **essential_kwargs,
+            )
+        except (cv2.error, TypeError) as exc:
+            report.update(
+                status="essential_estimation_failed",
+                error=f"{first_error}; fallback: {exc}",
+            )
+            return prior_pose.copy(), report
+    if essential is None or ransac_mask is None:
+        report["status"] = "essential_estimation_failed"
+        return prior_pose.copy(), report
+    homography_mask = None
+    try:
+        _homography, homography_mask = cv2.findHomography(
+            points0 * target_focal,
+            points1 * target_focal,
+            method,
+            args.pose_refine_homography_threshold,
+            maxIters=args.pose_refine_ransac_max_iters,
+            confidence=0.999,
+        )
+    except (cv2.error, TypeError):
+        try:
+            _homography, homography_mask = cv2.findHomography(
+                points0 * target_focal,
+                points1 * target_focal,
+                cv2.RANSAC,
+                args.pose_refine_homography_threshold,
+            )
+        except (cv2.error, TypeError):
+            homography_mask = None
+    if homography_mask is None:
+        report.update(
+            status="homography_degeneracy_check_failed",
+            sample_count=int(len(points0)),
+            ransac_inliers=int(np.count_nonzero(ransac_mask)),
+        )
+        return prior_pose.copy(), report
+    homography_inliers = int(np.count_nonzero(homography_mask))
+
+    prior_rotation = np.asarray(prior_pose[:3, :3], dtype=np.float64)
+    prior_translation = np.asarray(prior_pose[:3, 3], dtype=np.float64)
+    baseline = float(np.linalg.norm(prior_translation))
+    if baseline <= 1e-12:
+        report["status"] = "zero_prior_baseline"
+        return prior_pose.copy(), report
+
+    candidate_reports: list[dict[str, Any]] = []
+    best: tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]] | None = None
+    for candidate in _essential_candidates(essential):
+        try:
+            recovered, rotation, translation, pose_mask = cv2.recoverPose(
+                candidate,
+                points0,
+                points1,
+                np.eye(3, dtype=np.float64),
+                mask=np.asarray(ransac_mask, dtype=np.uint8).copy(),
+            )
+        except cv2.error:
+            continue
+        inliers = np.asarray(pose_mask).reshape(-1) > 0
+        inlier_count = int(np.count_nonzero(inliers))
+        inlier_ratio = inlier_count / max(len(points0), 1)
+        rotation_delta = rotation_angle_deg(rotation @ prior_rotation.T)
+        translation_delta = vector_angle_deg(
+            translation.reshape(3), prior_translation
+        )
+        item = {
+            "inliers": inlier_count,
+            "inlier_ratio": inlier_ratio,
+            "recover_pose_inliers": int(recovered),
+            "rotation_delta_deg": rotation_delta,
+            "translation_direction_delta_deg": translation_delta,
+            "homography_to_essential_inlier_ratio": (
+                homography_inliers / max(inlier_count, 1)
+            ),
+        }
+        candidate_reports.append(item)
+        if (
+            inlier_count < args.pose_refine_min_inliers
+            or inlier_ratio < args.pose_refine_min_inlier_ratio
+            or rotation_delta > args.pose_refine_max_rotation_deg
+            or translation_delta > args.pose_refine_max_translation_deg
+            or item["homography_to_essential_inlier_ratio"]
+            >= args.pose_refine_max_homography_dominance
+        ):
+            continue
+        if best is None or (inlier_count, -rotation_delta, -translation_delta) > (
+            best[3]["inliers"],
+            -best[3]["rotation_delta_deg"],
+            -best[3]["translation_direction_delta_deg"],
+        ):
+            best = (rotation, translation.reshape(3), inliers, item)
+
+    report.update(
+        status="quality_gate_rejected",
+        sample_count=int(len(points0)),
+        ransac_inliers=int(np.count_nonzero(ransac_mask)),
+        homography_inliers=homography_inliers,
+        candidates=candidate_reports,
+    )
+    if best is None:
+        return prior_pose.copy(), report
+
+    rotation, translation, inliers, selected_report = best
+    delta_rvec, _ = cv2.Rodrigues(rotation @ prior_rotation.T)
+    blended_delta, _ = cv2.Rodrigues(
+        delta_rvec.reshape(3) * args.pose_refine_strength
+    )
+    refined_rotation = blended_delta @ prior_rotation
+    refined_direction = _blend_direction(
+        prior_translation,
+        translation,
+        args.pose_refine_strength,
+    )
+    refined_pose = np.eye(4, dtype=np.float64)
+    refined_pose[:3, :3] = refined_rotation
+    refined_pose[:3, 3] = refined_direction * baseline
+
+    before = epipolar_error_target_pixels(
+        points0[inliers], points1[inliers], prior_pose, target_focal
+    )
+    after = epipolar_error_target_pixels(
+        points0[inliers], points1[inliers], refined_pose, target_focal
+    )
+    before_p50 = float(np.median(before)) if len(before) else math.inf
+    before_p95 = float(np.quantile(before, 0.95)) if len(before) else math.inf
+    after_p50 = float(np.median(after)) if len(after) else math.inf
+    after_p95 = float(np.quantile(after, 0.95)) if len(after) else math.inf
+    improvement = (before_p50 - after_p50) / max(before_p50, 1e-6)
+    report.update(
+        selected=selected_report,
+        prior_epipolar_p50_px=before_p50,
+        prior_epipolar_p95_px=before_p95,
+        refined_epipolar_p50_px=after_p50,
+        refined_epipolar_p95_px=after_p95,
+        median_improvement_fraction=improvement,
+        strength=float(args.pose_refine_strength),
+    )
+    if (
+        not math.isfinite(after_p50)
+        or improvement < args.pose_refine_min_improvement
+        or after_p95 > before_p95 * 1.05
+    ):
+        report["status"] = "improvement_gate_rejected"
+        return prior_pose.copy(), report
+    report.update(status="accepted", accepted=True)
+    return refined_pose, report
+
+
 def triangulate_matches(
     target_xy_normalized: np.ndarray,
     reference_xy_normalized: np.ndarray,
@@ -900,8 +1210,41 @@ def process_camera_candidate(
         )
     xs = target_normalized.reshape(-1, 2)[flat_indices]
     xp = reference_normalized.reshape(-1, 2)[flat_indices]
-    reference_from_target = relative_pose(reference_camera, target_camera)
     target_focal = float(math.sqrt(target_camera.K[0, 0] * target_camera.K[1, 1]))
+    prior_reference_from_target = relative_pose(reference_camera, target_camera)
+    pose_quality = (
+        overlap_combined.reshape(-1)[flat_indices]
+        * np.exp(
+            -0.5
+            * (
+                fb_error.reshape(-1)[flat_indices]
+                / max(args.fb_threshold, 1e-6)
+            )
+            ** 2
+        )
+    )
+    reference_from_target, pose_refinement = refine_reference_from_target_pose(
+        xs,
+        xp,
+        identity.reshape(-1, 2)[flat_indices],
+        pose_quality,
+        prior_reference_from_target,
+        target_camera.image_size,
+        target_focal,
+        args,
+    )
+    if args.pose_refinement != "off":
+        print(
+            f"[{name}] 单帧外参修正：{pose_refinement['status']}"
+            + (
+                "; rotation="
+                f"{pose_refinement['selected']['rotation_delta_deg']:.3f}deg, "
+                "translation direction="
+                f"{pose_refinement['selected']['translation_direction_delta_deg']:.3f}deg"
+                if pose_refinement.get("accepted")
+                else ""
+            )
+        )
     epipolar = epipolar_error_target_pixels(xs, xp, reference_from_target, target_focal)
     geometry = triangulate_matches(xs, xp, reference_from_target, target_focal)
 
@@ -972,6 +1315,7 @@ def process_camera_candidate(
         "triangulation_angle_deg_quantiles": quantiles(angle_values),
         "depth_target_z_quantiles": quantiles(depth_map[full_valid]),
         "confidence_quantiles": quantiles(weight[full_valid]),
+        "pose_refinement": pose_refinement,
     }
     return CameraCandidate(
         name=name,
@@ -982,6 +1326,7 @@ def process_camera_candidate(
         coarse_image=coarse,
         coarse_map_xy=coarse_map,
         coarse_mask=coarse_mask,
+        reference_from_target=reference_from_target,
         report=report,
     )
 
@@ -1522,11 +1867,16 @@ def render_reference_from_target_depth(
     depth: np.ndarray,
     depth_valid: np.ndarray,
     occlusion_tolerance: float,
+    reference_from_target_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     depth_array = np.asarray(depth, dtype=np.float64)
     safe_depth = np.where(depth_valid & np.isfinite(depth_array), depth_array, 1.0)
     Xs = np.asarray(target_rays, dtype=np.float64) * safe_depth[..., None]
-    reference_from_target = relative_pose(reference_camera, target_camera)
+    reference_from_target = (
+        np.asarray(reference_from_target_override, dtype=np.float64)
+        if reference_from_target_override is not None
+        else relative_pose(reference_camera, target_camera)
+    )
     projected, z_reference = project_points(Xs.reshape(-1, 3), reference_from_target, reference_camera)
     map_xy = projected.reshape(*depth.shape, 2).astype(np.float32)
     z_reference_map = z_reference.reshape(depth.shape)
@@ -1750,6 +2100,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="fast",
     )
     parser.add_argument("--representation", choices=("gray", "rgb", "structure"), default="gray")
+    parser.add_argument(
+        "--pose-refinement",
+        choices=("off", "essential"),
+        default="off",
+        help="guarded per-frame rotation/translation-direction refinement around calibration",
+    )
+    parser.add_argument("--pose-refine-ransac-threshold", type=float, default=1.5)
+    parser.add_argument("--pose-refine-ransac-max-iters", type=int, default=10000)
+    parser.add_argument("--pose-refine-homography-threshold", type=float, default=2.0)
+    parser.add_argument(
+        "--pose-refine-max-homography-dominance",
+        type=float,
+        default=0.95,
+        help="reject pose updates explainable almost entirely by one homography",
+    )
+    parser.add_argument("--pose-refine-max-samples", type=int, default=5000)
+    parser.add_argument("--pose-refine-min-inliers", type=int, default=80)
+    parser.add_argument("--pose-refine-min-inlier-ratio", type=float, default=0.25)
+    parser.add_argument("--pose-refine-max-rotation-deg", type=float, default=3.0)
+    parser.add_argument("--pose-refine-max-translation-deg", type=float, default=8.0)
+    parser.add_argument("--pose-refine-min-improvement", type=float, default=0.05)
+    parser.add_argument("--pose-refine-strength", type=float, default=1.0)
     parser.add_argument("--reference-depth", default="auto", help="auto、infinity或标定平移单位的正数")
     parser.add_argument("--overlap-threshold", type=float, default=0.10)
     parser.add_argument("--fb-threshold", type=float, default=2.0, help="RoMa前后向误差，目标相机像素")
@@ -1854,6 +2226,31 @@ def validate_args(args: argparse.Namespace) -> None:
             raise DepthAlignmentError(f"--{name.replace('_', '-')}不能小于0")
     if args.fill_radius < 0 or args.minimum_matches < 8:
         raise DepthAlignmentError("--fill-radius必须非负，--minimum-matches至少为8")
+    if args.pose_refine_max_samples < 8 or args.pose_refine_min_inliers < 8:
+        raise DepthAlignmentError("单帧外参修正的样本数和最少内点数必须至少为8")
+    if args.pose_refine_min_inliers > args.pose_refine_max_samples:
+        raise DepthAlignmentError("单帧外参修正的最少内点数不能超过最大样本数")
+    if args.pose_refine_ransac_max_iters < 1:
+        raise DepthAlignmentError("--pose-refine-ransac-max-iters必须大于0")
+    if not 0.0 < args.pose_refine_ransac_threshold:
+        raise DepthAlignmentError("--pose-refine-ransac-threshold必须大于0")
+    if not 0.0 < args.pose_refine_homography_threshold:
+        raise DepthAlignmentError("--pose-refine-homography-threshold必须大于0")
+    if not 0.0 < args.pose_refine_max_homography_dominance <= 1.5:
+        raise DepthAlignmentError(
+            "--pose-refine-max-homography-dominance必须在(0,1.5]内"
+        )
+    if not 0.0 <= args.pose_refine_min_inlier_ratio <= 1.0:
+        raise DepthAlignmentError("--pose-refine-min-inlier-ratio必须在[0,1]内")
+    if not 0.0 <= args.pose_refine_min_improvement < 1.0:
+        raise DepthAlignmentError("--pose-refine-min-improvement必须在[0,1)内")
+    if not 0.0 < args.pose_refine_strength <= 1.0:
+        raise DepthAlignmentError("--pose-refine-strength必须在(0,1]内")
+    if (
+        args.pose_refine_max_rotation_deg <= 0
+        or args.pose_refine_max_translation_deg <= 0
+    ):
+        raise DepthAlignmentError("单帧外参修正的最大漂移角必须大于0")
     if args.completion_iterations < 1:
         raise DepthAlignmentError("--completion-iterations至少为1")
     if args.completion_edge_sigma <= 0 or args.completion_line_min_length <= 0:
@@ -2112,6 +2509,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     rendering_reports: dict[str, Any] = {}
     for name in REFERENCE_NAMES:
+        candidate_lookup = next((item for item in candidates if item.name == name), None)
+        frame_reference_from_target = (
+            candidate_lookup.reference_from_target
+            if candidate_lookup is not None
+            else relative_pose(reference_models[name], target_model)
+        )
+        map_payload[f"reference_from_target__{name}"] = (
+            frame_reference_from_target.astype(np.float64)
+        )
         aligned, visible_mask, map_xy, z_reference = render_reference_from_target_depth(
             references[name],
             reference_models[name],
@@ -2120,10 +2526,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             render_depth,
             render_valid,
             args.occlusion_tolerance,
+            frame_reference_from_target,
         )
         reliable_visible = (visible_mask > 0) & reliable
         preview = aligned.copy()
-        candidate_lookup = next((item for item in candidates if item.name == name), None)
         coarse_valid = np.zeros_like(visible_mask, dtype=bool)
         if candidate_lookup is not None:
             invalid = visible_mask == 0
@@ -2221,6 +2627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 completion_result.depth,
                 completion_result.valid,
                 args.occlusion_tolerance,
+                frame_reference_from_target,
             )
             completed_visible = completed_visible_mask > 0
             completed_added = completed_visible & ~(visible_mask > 0)
@@ -2366,6 +2773,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "settings": {
             "roma_setting": args.roma_setting,
             "representation": args.representation,
+            "pose_refinement": args.pose_refinement,
+            "pose_refine_ransac_threshold_px": args.pose_refine_ransac_threshold,
+            "pose_refine_max_samples": args.pose_refine_max_samples,
+            "pose_refine_homography_threshold_px": args.pose_refine_homography_threshold,
+            "pose_refine_max_homography_dominance": args.pose_refine_max_homography_dominance,
+            "pose_refine_min_inliers": args.pose_refine_min_inliers,
+            "pose_refine_min_inlier_ratio": args.pose_refine_min_inlier_ratio,
+            "pose_refine_max_rotation_deg": args.pose_refine_max_rotation_deg,
+            "pose_refine_max_translation_deg": args.pose_refine_max_translation_deg,
+            "pose_refine_min_improvement": args.pose_refine_min_improvement,
+            "pose_refine_strength": args.pose_refine_strength,
             "reference_depth": args.reference_depth,
             "overlap_threshold": args.overlap_threshold,
             "fb_threshold": args.fb_threshold,

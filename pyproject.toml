@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multi-camera-unknown-intrinsics-alignment"
-version = "2.0.0"
-description = "Calibrate a fixed rig with 2+ known-intrinsics cameras and align them to one unknown-intrinsics camera"
+version = "2.1.0"
+description = "Calibrate and align 2+ reference cameras to a target from known or weakly seeded intrinsics"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

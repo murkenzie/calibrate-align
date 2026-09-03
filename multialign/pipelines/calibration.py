@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-PROGRAM_VERSION = "1.0"
+PROGRAM_VERSION = "1.1"
 REFERENCE_CAMERAS = ("reference_a", "reference_b")
 TARGET_CAMERA = "target"
 ANCHOR_CAMERA = REFERENCE_CAMERAS[0]
@@ -459,10 +459,19 @@ def calibration_command(
         "--anchor-camera", ANCHOR_CAMERA,
         "--scale-reference-camera", SCALE_REFERENCE_CAMERA,
         "--pairs", *ALL_PAIRS,
-        "--reference-intrinsics", "fixed",
+        "--reference-intrinsics", args.reference_intrinsics,
         "--target-model", args.target_model,
+        "--rig-motion-model", args.rig_motion_model,
         "--reference-distortion", args.reference_distortion,
         "--target-distortion", args.target_distortion,
+        "--reference-focal-min", str(args.reference_focal_min),
+        "--reference-focal-max", str(args.reference_focal_max),
+        "--reference-focal-prior-sigma", str(args.reference_focal_prior_sigma),
+        "--unknown-reference-focal-min", str(args.unknown_reference_focal_min),
+        "--unknown-reference-focal-max", str(args.unknown_reference_focal_max),
+        "--unknown-reference-focal-prior-sigma", str(args.unknown_reference_focal_prior_sigma),
+        "--reference-pp-bound-fraction", str(args.reference_pp_bound_fraction),
+        "--reference-pp-prior-fraction", str(args.reference_pp_prior_fraction),
         "--target-focal-min", str(args.target_focal_min),
         "--target-focal-max", str(args.target_focal_max),
         "--target-pp-bound-fraction", str(args.target_pp_bound_fraction),
@@ -573,7 +582,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     calibration = parser.add_argument_group("多相机联合标定")
     calibration.add_argument(
-        "--target-model", choices=("fixed", "focal", "focal-pp"), default="focal-pp"
+        "--reference-intrinsics",
+        choices=("auto", "fixed", "tight", "weak"),
+        default="auto",
+        help="auto follows each reference camera's intrinsics_known flag",
+    )
+    calibration.add_argument(
+        "--target-model", choices=("auto", "fixed", "focal", "focal-pp"), default="auto"
+    )
+    calibration.add_argument(
+        "--rig-motion-model",
+        choices=("fixed", "small-drift"),
+        default="fixed",
+        help="small-drift keeps per-frame MAGSAC support for later guarded pose refinement",
     )
     calibration.add_argument(
         "--reference-distortion",
@@ -589,6 +610,14 @@ def build_parser() -> argparse.ArgumentParser:
     calibration.add_argument("--target-focal-max", type=float, default=1.60)
     calibration.add_argument("--target-pp-bound-fraction", type=float, default=0.08)
     calibration.add_argument("--target-pp-prior-fraction", type=float, default=0.03)
+    calibration.add_argument("--reference-focal-min", type=float, default=0.94)
+    calibration.add_argument("--reference-focal-max", type=float, default=1.06)
+    calibration.add_argument("--reference-focal-prior-sigma", type=float, default=0.02)
+    calibration.add_argument("--unknown-reference-focal-min", type=float, default=0.50)
+    calibration.add_argument("--unknown-reference-focal-max", type=float, default=2.00)
+    calibration.add_argument("--unknown-reference-focal-prior-sigma", type=float, default=0.45)
+    calibration.add_argument("--reference-pp-bound-fraction", type=float, default=0.08)
+    calibration.add_argument("--reference-pp-prior-fraction", type=float, default=0.04)
     calibration.add_argument("--scale-baseline-mm", type=float, default=None)
     calibration.add_argument("--baseline-log-sigma", type=float, default=0.25)
     calibration.add_argument("--gauge-log-sigma", type=float, default=0.03)
@@ -637,6 +666,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--validation-fraction必须在[0,0.5)内")
     if not 0 < args.target_focal_min < args.target_focal_max:
         raise PipelineError("target focal bounds are invalid")
+    if not 0 < args.reference_focal_min < args.reference_focal_max:
+        raise PipelineError("reference focal bounds are invalid")
+    if not 0 < args.unknown_reference_focal_min < args.unknown_reference_focal_max:
+        raise PipelineError("unknown reference focal bounds are invalid")
     unknown_strict = [
         name for name in args.strict_reference_cameras
         if name not in REFERENCE_CAMERAS

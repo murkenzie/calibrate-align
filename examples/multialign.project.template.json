@@ -25,5 +25,27 @@
     "device": "auto",
     "precision": "auto",
     "allow_cpu": false
+  },
+  "calibration": {
+    "reference_intrinsics": "auto",
+    "target_model": "auto",
+    "reference_distortion": "fixed",
+    "target_distortion": "fixed",
+    "rig_motion_model": "fixed"
+  },
+  "alignment": {
+    "render_mode": "strict",
+    "pose_refinement": "off",
+    "pose_refine_ransac_threshold": 1.5,
+    "pose_refine_ransac_max_iters": 10000,
+    "pose_refine_max_samples": 5000,
+    "pose_refine_homography_threshold": 2.0,
+    "pose_refine_max_homography_dominance": 0.95,
+    "pose_refine_max_rotation_deg": 3.0,
+    "pose_refine_max_translation_deg": 8.0,
+    "pose_refine_min_inliers": 80,
+    "pose_refine_min_inlier_ratio": 0.25,
+    "pose_refine_min_improvement": 0.05,
+    "pose_refine_strength": 1.0
   }
 }

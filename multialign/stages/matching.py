@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 r"""
-Extract correspondence points from a fixed rig containing two or more
-reference cameras and one target camera, then diagnose whether one fundamental
-matrix per pair is shared by all natural scenes.
+Extract correspondence points from a nominal rig containing two or more
+reference cameras and one target camera, then diagnose how closely one
+fundamental matrix per pair is shared by all natural scenes.
 
 This is deliberately a geometry program, not an image-warping program:
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Jointly calibrate a fixed multi-camera reference/target rig.
+"""Jointly calibrate a multi-camera reference/target rig from rough or known K.
 
 The program consumes full-image sparse-match NPZ files produced by
 :mod:`multialign.stages.matching`. Every pair must come from the RoMa-all cache
-protocol. Known reference intrinsics are fixed by default; low-order distortion
-is refined under strong priors. The unknown target focal length (and optionally
-its principal point) is refined together with one globally consistent pose graph.
+protocol. Known reference intrinsics can remain fixed. Unknown reference and
+target focal lengths (and optionally principal points) are refined under
+bounded priors with one globally consistent nominal pose graph.
 
 Natural-scene epipolar geometry has no absolute translation scale.  Camera
 centres are therefore expressed in the configured anchor-camera coordinate
@@ -47,7 +47,7 @@ STRICT_REFERENCE_CAMERAS: frozenset[str] = frozenset()
 CAMERAS = (*REFERENCE_CAMERAS, TARGET_CAMERA)
 CAMERA_INDEX = {name: index for index, name in enumerate(CAMERAS)}
 NON_ANCHOR = tuple(name for name in CAMERAS if name != ANCHOR_CAMERA)
-PROGRAM_VERSION = "3.2-prior-safe-robust-loss"
+PROGRAM_VERSION = "3.3-weak-intrinsics-safe"
 DISTORTION_NAMES = ("k1", "k2", "p1", "p2", "k3")
 
 
@@ -112,6 +112,8 @@ class CameraSeed:
     source_size_wh: tuple[int, int]
     K0: np.ndarray
     dist0: np.ndarray
+    intrinsics_known: bool = False
+    seed_source: str = "provided_K"
 
 
 @dataclass
@@ -147,6 +149,7 @@ class ParameterLayout:
     rotation: dict[str, slice]
     center: dict[str, slice]
     reference_log_scale: dict[str, int]
+    reference_pp: dict[str, slice]
     target_log_scale: int | None
     target_pp: slice | None
     distortion: dict[str, dict[int, int]]
@@ -163,6 +166,7 @@ class StageResult:
     bound_hits: list[str]
     gate_passed: bool
     gate_reasons: list[str]
+    intrinsic_policy_satisfied: bool = False
 
 
 def json_safe(value: Any) -> Any:
@@ -424,32 +428,107 @@ def load_camera_seeds(
         item = cameras.get(name)
         if not isinstance(item, dict):
             raise CalibrationError(f"初始校准缺少 {name}")
-        key = "K" if "K" in item else "intrinsic"
-        if key not in item:
-            raise CalibrationError(f"{name} 缺少 K/intrinsic")
-        K = np.asarray(item[key], dtype=np.float64)
-        if K.shape != (3, 3) or not np.isfinite(K).all():
-            raise CalibrationError(f"{name} 的K无效")
-        source_size = tuple(int(x) for x in item.get("image_size", sizes[name]))
         target_size = sizes[name]
-        if len(source_size) != 2 or min(source_size) <= 0:
-            raise CalibrationError(f"{name} 的image_size无效：{source_size}")
-        source_aspect = source_size[0] / source_size[1]
-        target_aspect = target_size[0] / target_size[1]
-        if not math.isclose(source_aspect, target_aspect, rel_tol=0.01):
-            raise CalibrationError(
-                f"{name} 长宽比不一致：{source_size} -> {target_size}"
+        key = "K" if "K" in item else "intrinsic" if "intrinsic" in item else None
+        raw_K = item.get(key) if key is not None else None
+        auto_K = raw_K is None or (
+            isinstance(raw_K, str) and raw_K.strip().casefold() == "auto"
+        )
+        if auto_K:
+            source_size = target_size
+            width, height = target_size
+            f35 = item.get("focal_length_35mm")
+            focal_ratio = item.get("focal_ratio")
+            if f35 is not None:
+                try:
+                    f35_value = float(f35)
+                except (TypeError, ValueError) as exc:
+                    raise CalibrationError(
+                        f"{name}.focal_length_35mm必须是正数"
+                    ) from exc
+                if not math.isfinite(f35_value) or f35_value <= 0:
+                    raise CalibrationError(f"{name}.focal_length_35mm必须是正数")
+                full_frame_diagonal_mm = math.hypot(36.0, 24.0)
+                focal = math.hypot(width, height) * f35_value / full_frame_diagonal_mm
+                seed_source = "focal_length_35mm"
+            elif focal_ratio is not None:
+                try:
+                    ratio_value = float(focal_ratio)
+                except (TypeError, ValueError) as exc:
+                    raise CalibrationError(f"{name}.focal_ratio必须是正数") from exc
+                if not math.isfinite(ratio_value) or ratio_value <= 0:
+                    raise CalibrationError(f"{name}.focal_ratio必须是正数")
+                focal = max(width, height) * ratio_value
+                seed_source = "focal_ratio_times_max_dimension"
+            else:
+                focal = max(width, height)
+                seed_source = "default_max_dimension"
+            pp_fraction = item.get("principal_point_fraction", (0.5, 0.5))
+            try:
+                pp_values = tuple(float(value) for value in pp_fraction)
+            except (TypeError, ValueError) as exc:
+                raise CalibrationError(
+                    f"{name}.principal_point_fraction必须是两个数"
+                ) from exc
+            if len(pp_values) != 2 or not all(
+                math.isfinite(value) and 0.0 <= value <= 1.0 for value in pp_values
+            ):
+                raise CalibrationError(
+                    f"{name}.principal_point_fraction必须是[0,1]内的两个数"
+                )
+            K = np.asarray(
+                [
+                    [focal, 0.0, width * pp_values[0]],
+                    [0.0, focal, height * pp_values[1]],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
             )
-        K = np.diag(
-            [target_size[0] / source_size[0], target_size[1] / source_size[1], 1.0]
-        ) @ K
+        else:
+            try:
+                K = np.asarray(raw_K, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise CalibrationError(f"{name} 的K无效") from exc
+            if K.shape != (3, 3) or not np.isfinite(K).all():
+                raise CalibrationError(f"{name} 的K无效")
+            raw_size = item.get("image_size", sizes[name])
+            try:
+                source_size = tuple(int(x) for x in raw_size)
+            except (TypeError, ValueError) as exc:
+                raise CalibrationError(f"{name} 的image_size无效：{raw_size}") from exc
+            if len(source_size) != 2 or min(source_size) <= 0:
+                raise CalibrationError(f"{name} 的image_size无效：{source_size}")
+            source_aspect = source_size[0] / source_size[1]
+            target_aspect = target_size[0] / target_size[1]
+            if not math.isclose(source_aspect, target_aspect, rel_tol=0.01):
+                raise CalibrationError(
+                    f"{name} 长宽比不一致：{source_size} -> {target_size}"
+                )
+            K = np.diag(
+                [target_size[0] / source_size[0], target_size[1] / source_size[1], 1.0]
+            ) @ K
+            seed_source = "provided_K"
         dist = np.asarray(item.get("dist", np.zeros(5)), dtype=np.float64).reshape(-1)
         if len(dist) < 5:
             dist = np.pad(dist, (0, 5 - len(dist)))
         dist = dist[:5]
         if K[0, 0] <= 0 or K[1, 1] <= 0 or not np.isfinite(dist).all():
             raise CalibrationError(f"{name} 的焦距或畸变无效")
-        result[name] = CameraSeed(name, target_size, source_size, K, dist)
+        default_known = name in REFERENCE_CAMERAS and not auto_K
+        intrinsics_known = bool(item.get("intrinsics_known", default_known))
+        if auto_K and intrinsics_known:
+            raise CalibrationError(
+                f"{name}使用K=auto，不能同时声明intrinsics_known=true"
+            )
+        result[name] = CameraSeed(
+            name,
+            target_size,
+            source_size,
+            K,
+            dist,
+            intrinsics_known,
+            seed_source,
+        )
     return result, calibration
 
 
@@ -491,7 +570,15 @@ def override_target_seed(
     if K[0, 0] <= 0 or K[1, 1] <= 0 or not np.isfinite(dist).all():
         raise CalibrationError(f"目标相机初值焦距或畸变无效：{path}")
     previous = seeds[TARGET_CAMERA]
-    seeds[TARGET_CAMERA] = CameraSeed(TARGET_CAMERA, target, source, K, dist)
+    seeds[TARGET_CAMERA] = CameraSeed(
+        TARGET_CAMERA,
+        target,
+        source,
+        K,
+        dist,
+        bool(item.get("intrinsics_known", previous.intrinsics_known)),
+        "target_seed_override",
+    )
     return {
         "path": path,
         "source_size_wh": source,
@@ -500,6 +587,43 @@ def override_target_seed(
         "override_K": K,
         "previous_dist": previous.dist0,
         "override_dist": dist,
+    }
+
+
+def resolve_intrinsic_policies(
+    args: argparse.Namespace,
+    seeds: dict[str, CameraSeed],
+) -> dict[str, Any]:
+    """Resolve auto policies only after camera seed metadata is available."""
+    requested_reference = args.reference_intrinsics
+    requested_target = args.target_model
+    reference_flags = {
+        name: bool(seeds[name].intrinsics_known) for name in REFERENCE_CAMERAS
+    }
+    if requested_reference == "auto":
+        args.reference_intrinsics = (
+            "fixed" if all(reference_flags.values()) else "weak"
+        )
+    if requested_target == "auto":
+        args.target_model = (
+            "fixed" if seeds[TARGET_CAMERA].intrinsics_known else "focal-pp"
+        )
+    return {
+        "requested_reference_intrinsics": requested_reference,
+        "resolved_reference_intrinsics": args.reference_intrinsics,
+        "requested_target_model": requested_target,
+        "resolved_target_model": args.target_model,
+        "intrinsics_known": {
+            name: bool(seed.intrinsics_known) for name, seed in seeds.items()
+        },
+        "seed_source": {name: seed.seed_source for name, seed in seeds.items()},
+        "warning": (
+            "At least one reference K is unknown, so all reference focal lengths and "
+            "principal points share bounded weak-prior optimization. Treat the result "
+            "as self-calibration and require independent validation."
+            if args.reference_intrinsics == "weak"
+            else None
+        ),
     }
 
 
@@ -768,11 +892,11 @@ def shared_geometry_filter(
     seeds: dict[str, CameraSeed],
     args: argparse.Namespace,
 ) -> tuple[list[MatchGroup], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Remove points that disagree with a fixed cross-scene F for each pair.
+    """Remove points that strongly disagree with a nominal cross-scene F.
 
     Per-frame MAGSAC can accept a self-consistent but wrong solution on a
-    texture-poor telephoto crop.  A real fixed rig has one F per camera pair,
-    so a second cross-scene pass is a strong and appropriate outlier test.
+    texture-poor telephoto crop. A second cross-scene pass is a strong outlier
+    test; small-drift mode deliberately widens only this shared-F gate.
     """
     current = list(groups)
     excluded: list[dict[str, Any]] = []
@@ -810,10 +934,15 @@ def shared_geometry_filter(
                 for group in fitting
             ])
             is_long = pair_contains_strict_reference(pair)
-            threshold = (
+            base_threshold = (
                 args.strict_shared_point_threshold
                 if is_long
                 else args.shared_point_threshold
+            )
+            threshold = base_threshold * (
+                args.small_drift_shared_threshold_multiplier
+                if args.rig_motion_model == "small-drift"
+                else 1.0
             )
             minimum_ratio = (
                 args.strict_minimum_shared_inlier_ratio
@@ -895,6 +1024,8 @@ def shared_geometry_filter(
                 next_groups.append(group)
             iteration_report["pairs"][pair_label(pair)] = {
                 "strict_reference_mode": is_long,
+                "rig_motion_model": args.rig_motion_model,
+                "base_point_threshold_common_px": base_threshold,
                 "point_threshold_common_px": threshold,
                 "minimum_group_inlier_ratio": minimum_ratio,
                 "groups_before": len(pair_groups),
@@ -1243,6 +1374,7 @@ def distortion_observability(
 def build_layout(
     optimize_pose: bool,
     optimize_reference: bool,
+    reference_pp: bool,
     optimize_target: bool,
     target_pp: bool,
     optimize_distortion: bool,
@@ -1262,6 +1394,11 @@ def build_layout(
         for camera in REFERENCE_CAMERAS:
             reference_log_scale[camera] = cursor
             cursor += 1
+    reference_pp_slices: dict[str, slice] = {}
+    if optimize_reference and reference_pp:
+        for camera in REFERENCE_CAMERAS:
+            reference_pp_slices[camera] = slice(cursor, cursor + 2)
+            cursor += 2
     target_log_scale = None
     target_pp_slice = None
     if optimize_target:
@@ -1281,7 +1418,7 @@ def build_layout(
             if mapping:
                 distortion[camera] = mapping
     return ParameterLayout(
-        rotation, center, reference_log_scale, target_log_scale,
+        rotation, center, reference_log_scale, reference_pp_slices, target_log_scale,
         target_pp_slice, distortion, cursor
     )
 
@@ -1305,6 +1442,12 @@ def pack_model(
             / (seeds[camera].K0[0, 0] * seeds[camera].K0[1, 1])
         )
         x[index] = math.log(scale)
+    for camera, item_slice in layout.reference_pp.items():
+        seed = seeds[camera]
+        x[item_slice] = [
+            (model.intrinsics[camera][0, 2] - seed.K0[0, 2]) / seed.size_wh[0],
+            (model.intrinsics[camera][1, 2] - seed.K0[1, 2]) / seed.size_wh[1],
+        ]
     if layout.target_log_scale is not None:
         camera = TARGET_CAMERA
         scale = math.sqrt(
@@ -1352,22 +1495,38 @@ def unpack_model(
     }
     for camera, index in layout.reference_log_scale.items():
         scale = math.exp(float(x[index]))
-        intrinsics[camera][0, 0] *= scale
-        intrinsics[camera][1, 1] *= scale
+        intrinsics[camera][0, 0] = seeds[camera].K0[0, 0] * scale
+        intrinsics[camera][1, 1] = seeds[camera].K0[1, 1] * scale
+    for camera, item_slice in layout.reference_pp.items():
+        dx, dy = x[item_slice]
+        intrinsics[camera][0, 2] = (
+            seeds[camera].K0[0, 2] + dx * seeds[camera].size_wh[0]
+        )
+        intrinsics[camera][1, 2] = (
+            seeds[camera].K0[1, 2] + dy * seeds[camera].size_wh[1]
+        )
     if layout.target_log_scale is not None:
         scale = math.exp(float(x[layout.target_log_scale]))
-        intrinsics[TARGET_CAMERA][0, 0] *= scale
-        intrinsics[TARGET_CAMERA][1, 1] *= scale
+        intrinsics[TARGET_CAMERA][0, 0] = seeds[TARGET_CAMERA].K0[0, 0] * scale
+        intrinsics[TARGET_CAMERA][1, 1] = seeds[TARGET_CAMERA].K0[1, 1] * scale
     if layout.target_pp is not None:
         dx, dy = x[layout.target_pp]
-        intrinsics[TARGET_CAMERA][0, 2] += dx * seeds[TARGET_CAMERA].size_wh[0]
-        intrinsics[TARGET_CAMERA][1, 2] += dy * seeds[TARGET_CAMERA].size_wh[1]
+        intrinsics[TARGET_CAMERA][0, 2] = (
+            seeds[TARGET_CAMERA].K0[0, 2]
+            + dx * seeds[TARGET_CAMERA].size_wh[0]
+        )
+        intrinsics[TARGET_CAMERA][1, 2] = (
+            seeds[TARGET_CAMERA].K0[1, 2]
+            + dy * seeds[TARGET_CAMERA].size_wh[1]
+        )
     distortion = {
         name: value.copy() for name, value in base_model.distortion.items()
     }
     for camera, mapping in layout.distortion.items():
         for coefficient, index in mapping.items():
-            distortion[camera][coefficient] += float(x[index])
+            distortion[camera][coefficient] = (
+                seeds[camera].dist0[coefficient] + float(x[index])
+            )
     return RigModel(rotations, centers, intrinsics, distortion)
 
 
@@ -1391,9 +1550,18 @@ def parameter_bounds(
             names[layout.rotation[camera].start + axis] = f"{camera}.rotation_{label}"
             names[layout.center[camera].start + axis] = f"{camera}.center_{label}"
     for camera, index in layout.reference_log_scale.items():
-        lower[index] = math.log(args.reference_focal_min)
-        upper[index] = math.log(args.reference_focal_max)
+        if args.reference_intrinsics == "weak":
+            lower[index] = math.log(args.unknown_reference_focal_min)
+            upper[index] = math.log(args.unknown_reference_focal_max)
+        else:
+            lower[index] = math.log(args.reference_focal_min)
+            upper[index] = math.log(args.reference_focal_max)
         names[index] = f"{camera}.focal_scale"
+    for camera, item_slice in layout.reference_pp.items():
+        lower[item_slice] = -args.reference_pp_bound_fraction
+        upper[item_slice] = args.reference_pp_bound_fraction
+        names[item_slice.start] = f"{camera}.cx_fraction"
+        names[item_slice.start + 1] = f"{camera}.cy_fraction"
     if layout.target_log_scale is not None:
         index = layout.target_log_scale
         lower[index] = math.log(args.target_focal_min)
@@ -1573,8 +1741,21 @@ def make_residual_function(
                 * max(prior_scale, 1.0)
             )
         for camera, index in layout.reference_log_scale.items():
+            sigma = (
+                args.unknown_reference_focal_prior_sigma
+                if args.reference_intrinsics == "weak"
+                else args.reference_focal_prior_sigma
+            )
             priors.append(
-                x[index] / args.reference_focal_prior_sigma * prior_scale
+                x[index] / sigma * prior_scale
+            )
+        for _camera, item_slice in layout.reference_pp.items():
+            priors.extend(
+                (
+                    x[item_slice]
+                    / args.reference_pp_prior_fraction
+                    * prior_scale
+                ).tolist()
             )
         if layout.target_log_scale is not None and args.target_focal_prior_sigma > 0:
             priors.append(
@@ -1786,10 +1967,13 @@ def optimize_stage(
     optimize_distortion: bool,
     args: argparse.Namespace,
 ) -> StageResult:
-    reference_tight = optimize_reference and args.reference_intrinsics == "tight"
+    reference_enabled = optimize_reference and args.reference_intrinsics in {
+        "tight", "weak"
+    }
+    reference_pp = reference_enabled and args.reference_intrinsics == "weak"
     target_pp = optimize_target and args.target_model == "focal-pp"
     layout = build_layout(
-        optimize_pose, reference_tight, optimize_target, target_pp,
+        optimize_pose, reference_enabled, reference_pp, optimize_target, target_pp,
         optimize_distortion, args
     )
     x0 = pack_model(start_model, initial_rotations, seeds, layout)
@@ -1818,6 +2002,38 @@ def optimize_stage(
         name, model, metrics, physical, bound_hits, reference_score, graph,
         seeds, optimize_distortion, args
     )
+    singular_values = np.linalg.svd(np.asarray(result.jac), compute_uv=False)
+    rank_tolerance = (
+        max(result.jac.shape)
+        * np.finfo(np.float64).eps
+        * float(singular_values[0])
+        if len(singular_values)
+        else math.inf
+    )
+    positive_singular = singular_values[singular_values > rank_tolerance]
+    jacobian_rank = int(len(positive_singular))
+    jacobian_condition = (
+        float(positive_singular[0] / positive_singular[-1])
+        if jacobian_rank == layout.size and jacobian_rank > 0
+        else math.inf
+    )
+    weak_intrinsics_stage = (
+        reference_enabled and args.reference_intrinsics == "weak"
+    ) or (
+        optimize_target and not seeds[TARGET_CAMERA].intrinsics_known
+    )
+    if not result.success:
+        passed = False
+        reasons.append("优化器未收敛：" + str(result.message))
+    if (
+        weak_intrinsics_stage
+        and jacobian_condition > args.maximum_jacobian_condition
+    ):
+        passed = False
+        reasons.append(
+            "弱内参自标定Jacobian条件数="
+            f"{jacobian_condition:.3e}，超过{args.maximum_jacobian_condition:.3e}"
+        )
     natural_gate_passed = passed
     natural_gate_reasons = list(reasons)
     if args.force_accept:
@@ -1825,12 +2041,6 @@ def optimize_stage(
         reasons = [
             "实验性强制接受：忽略留出误差、参数边界和物理安全门"
         ] + [f"已忽略：{reason}" for reason in natural_gate_reasons]
-    singular_values = np.linalg.svd(np.asarray(result.jac), compute_uv=False)
-    positive_singular = singular_values[singular_values > 1e-12]
-    jacobian_condition = (
-        float(positive_singular[0] / positive_singular[-1])
-        if len(positive_singular) else math.inf
-    )
     return StageResult(
         name, model,
         {
@@ -1838,9 +2048,12 @@ def optimize_stage(
             "message": str(result.message), "nfev": int(result.nfev),
             "cost": float(result.cost), "optimality": float(result.optimality),
             "jacobian_condition_number": jacobian_condition,
+            "jacobian_rank": jacobian_rank,
+            "jacobian_full_rank": jacobian_rank == layout.size,
             "parameter_count": int(layout.size),
             "optimize_pose": optimize_pose,
-            "optimize_reference_K": reference_tight,
+            "optimize_reference_K": reference_enabled,
+            "optimize_reference_principal_point": reference_pp,
             "optimize_target_K": optimize_target,
             "optimize_distortion": optimize_distortion,
             "data_loss": args.loss,
@@ -1929,6 +2142,31 @@ def scaled_output_model(model: RigModel, scale_baseline_mm: float | None) -> tup
     ), unit, scale
 
 
+def select_calibration_stage(
+    stages: Sequence[StageResult], force_accept: bool
+) -> tuple[StageResult, bool, list[StageResult]]:
+    """Select only stages that both pass gates and satisfy requested K policy."""
+    if not stages:
+        raise CalibrationError("没有可选择的优化阶段")
+
+    def selection_score(stage: StageResult) -> float:
+        value = stage.metrics["score"]["validation"]
+        return float(
+            value if value is not None else stage.metrics["score"]["train"]
+        )
+
+    eligible = [
+        stage
+        for stage in stages
+        if stage.gate_passed and stage.intrinsic_policy_satisfied
+    ]
+    if force_accept:
+        return stages[-1], False, eligible
+    if eligible:
+        return min(eligible, key=selection_score), True, eligible
+    return min(stages, key=selection_score), False, eligible
+
+
 def calibration_output(
     model: RigModel,
     seeds: dict[str, CameraSeed],
@@ -1953,9 +2191,12 @@ def calibration_output(
             "dist": model.distortion[camera].reshape(1, -1),
             "intrinsic_policy": (
                 "fixed_known_reference" if camera in REFERENCE_CAMERAS and args.reference_intrinsics == "fixed"
-                else "tight_known_reference_prior" if camera in REFERENCE_CAMERAS
+                else "tight_reference_prior" if camera in REFERENCE_CAMERAS and args.reference_intrinsics == "tight"
+                else "weak_reference_self_calibration" if camera in REFERENCE_CAMERAS
                 else args.target_model
             ),
+            "intrinsics_known_input": bool(seeds[camera].intrinsics_known),
+            "intrinsic_seed_source": seeds[camera].seed_source,
             "distortion_policy": (
                 args.resolved_distortion_modes[camera]
             ),
@@ -1973,12 +2214,13 @@ def calibration_output(
         centers[camera] = C
     return {
         "schema_version": 1,
-        "task": "fixed multi-camera joint epipolar calibration",
+        "task": "multi-camera joint epipolar calibration with bounded weak intrinsics",
         "accepted_for_use": accepted,
         "forced_output": args.force_accept,
         "selected_stage": selected_stage,
         "translation_unit": unit,
         "absolute_scale_observable": args.scale_baseline_mm is not None,
+        "rig_motion_model": args.rig_motion_model,
         "reference_cameras": list(REFERENCE_CAMERAS),
         "target_camera": TARGET_CAMERA,
         "anchor_camera": ANCHOR_CAMERA,
@@ -1995,8 +2237,8 @@ def calibration_output(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Joint natural-scene calibration for 2+ known-intrinsics references "
-            "and one unknown-intrinsics target"
+            "Joint natural-scene calibration for 2+ reference cameras and one "
+            "target, using known K or bounded weak K seeds"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -2029,12 +2271,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pairs", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
-        "--reference-intrinsics", choices=("fixed", "tight"), default="fixed",
-        help="fixed locks known K; tight allows a small shared focal scale change"
+        "--reference-intrinsics",
+        choices=("auto", "fixed", "tight", "weak"),
+        default="auto",
+        help=(
+            "auto reads intrinsics_known; fixed locks K; tight changes focal "
+            "slightly; weak jointly refines focal and principal point"
+        ),
     )
     parser.add_argument(
-        "--target-model", choices=("fixed", "focal", "focal-pp"),
-        default="focal-pp"
+        "--target-model", choices=("auto", "fixed", "focal", "focal-pp"),
+        default="auto"
+    )
+    parser.add_argument(
+        "--rig-motion-model",
+        choices=("fixed", "small-drift"),
+        default="fixed",
+        help=(
+            "small-drift diagnoses shared-F disagreement without deleting every "
+            "per-frame MAGSAC inlier; scene alignment still applies guarded pose refinement"
+        ),
     )
     parser.add_argument(
         "--reference-distortion",
@@ -2059,6 +2315,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-focal-min", type=float, default=0.94)
     parser.add_argument("--reference-focal-max", type=float, default=1.06)
     parser.add_argument("--reference-focal-prior-sigma", type=float, default=0.02)
+    parser.add_argument("--unknown-reference-focal-min", type=float, default=0.50)
+    parser.add_argument("--unknown-reference-focal-max", type=float, default=2.00)
+    parser.add_argument("--unknown-reference-focal-prior-sigma", type=float, default=0.45)
+    parser.add_argument("--reference-pp-bound-fraction", type=float, default=0.08)
+    parser.add_argument("--reference-pp-prior-fraction", type=float, default=0.04)
     parser.add_argument("--target-focal-min", type=float, default=0.55)
     parser.add_argument("--target-focal-max", type=float, default=1.60)
     parser.add_argument("--target-focal-prior-sigma", type=float, default=0.45)
@@ -2116,6 +2377,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="strict reference groups must retain at least this ratio and min-group-inliers",
     )
     parser.add_argument("--shared-filter-iterations", type=int, default=2)
+    parser.add_argument(
+        "--small-drift-shared-threshold-multiplier",
+        type=float,
+        default=3.0,
+        help="loosen only the cross-frame shared-F gate; per-frame MAGSAC stays unchanged",
+    )
     parser.add_argument("--homography-threshold", type=float, default=3.0)
     parser.add_argument("--ransac-confidence", type=float, default=0.999)
     parser.add_argument("--ransac-max-iters", type=int, default=50000)
@@ -2138,6 +2405,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--loss-scale", type=float, default=1.0)
     parser.add_argument("--max-nfev", type=int, default=120)
+    parser.add_argument(
+        "--maximum-jacobian-condition",
+        type=float,
+        default=1.0e12,
+        help="reject weak-intrinsics stages whose local parameterization is ill-conditioned",
+    )
     parser.add_argument(
         "--force-accept",
         action="store_true",
@@ -2168,12 +2441,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--minimum-distortion-validation-improvement必须在[0,0.5)内")
     if not (0 < args.reference_focal_min < args.reference_focal_max):
         parser.error("参考相机焦距边界无效")
+    if not (
+        0 < args.unknown_reference_focal_min < args.unknown_reference_focal_max
+    ):
+        parser.error("未知参考相机焦距边界无效")
     if not (0 < args.target_focal_min < args.target_focal_max):
         parser.error("目标相机焦距边界无效")
     if args.scale_baseline_mm is not None and args.scale_baseline_mm <= 0:
         parser.error("--scale-baseline-mm must be positive")
     if not 0.0 < args.target_pp_bound_fraction < 0.25:
         parser.error("--target-pp-bound-fraction must be in (0, 0.25)")
+    if not 0.0 < args.reference_pp_bound_fraction < 0.25:
+        parser.error("--reference-pp-bound-fraction must be in (0, 0.25)")
     if args.shared_filter_iterations < 1 or args.shared_filter_iterations > 5:
         parser.error("--shared-filter-iterations必须在1到5之间")
     for name in (
@@ -2194,6 +2473,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "shared_point_threshold", "strict_shared_point_threshold",
         "center_bound", "rotation_bound_deg", "maximum_baseline_ratio",
         "loss_scale",
+        "reference_focal_prior_sigma", "unknown_reference_focal_prior_sigma",
+        "reference_pp_prior_fraction", "target_focal_prior_sigma",
+        "target_pp_prior_fraction",
+        "maximum_jacobian_condition",
+        "small_drift_shared_threshold_multiplier",
     )
     for name in positive:
         if getattr(args, name) <= 0:
@@ -2236,6 +2520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_override = override_target_seed(
             seeds, args.target_seed_calibration
         )
+        intrinsic_policy = resolve_intrinsic_policies(args, seeds)
         if quality_report_path is not None and quality_decisions:
             print(
                 f"继承逐组质量门：{quality_report_path}"
@@ -2256,6 +2541,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"cx={K[0,2]:.3f}, cy={K[1,2]:.3f}"
             )
         print("匹配尺寸：" + ", ".join(f"{name}={sizes[name]}" for name in CAMERAS))
+        if intrinsic_policy["warning"]:
+            print("警告：" + intrinsic_policy["warning"])
         for name in CAMERAS:
             K = seeds[name].K0
             if name in REFERENCE_CAMERAS:
@@ -2269,7 +2556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"  {name:10s} fx={K[0,0]:.3f} fy={K[1,1]:.3f} "
                 f"cx={K[0,2]:.3f} cy={K[1,2]:.3f} "
-                f"[K={policy}, dist={distortion_policy}]"
+                f"[seed={seeds[name].seed_source}, K={policy}, dist={distortion_policy}]"
             )
         print("逐组MAGSAC清洗与全图均衡采样……")
         groups, excluded = prepare_groups(
@@ -2378,12 +2665,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             for reason in stage.gate_reasons:
                 print("  - " + reason)
 
+        optimize_reference = args.reference_intrinsics in {"tight", "weak"}
+        optimize_target = args.target_model != "fixed"
+        optimize_distortion = any(
+            mode != "fixed" for mode in args.resolved_distortion_modes.values()
+        )
+        requires_intrinsic_solution = optimize_reference or optimize_target
+        current_has_intrinsic_solution = not requires_intrinsic_solution
+
         stages: list[StageResult] = []
         pose_stage = optimize_stage(
             "01_pose_fixed_K_dist", seed_model, groups, rotations, centers,
             seeds, graph, reference_score,
             True, False, False, False, args
         )
+        pose_stage.intrinsic_policy_satisfied = current_has_intrinsic_solution
         stages.append(pose_stage)
         show_stage(pose_stage, "阶段1：固定K和畸变，只优化外参：")
         current = (
@@ -2397,28 +2693,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             else seed_metrics
         )
 
-        optimize_reference = args.reference_intrinsics == "tight"
-        optimize_target = args.target_model != "fixed"
-        optimize_distortion = any(
-            mode != "fixed" for mode in args.resolved_distortion_modes.values()
-        )
         if optimize_reference or optimize_target:
             intrinsic_stage = optimize_stage(
                 "02_pose_and_K_fixed_dist", current, groups, rotations, centers,
                 seeds, graph, score_of(current_metrics),
                 True, optimize_reference, optimize_target, False, args
             )
+            intrinsic_stage.intrinsic_policy_satisfied = True
             stages.append(intrinsic_stage)
             show_stage(intrinsic_stage, "阶段2：固定畸变，优化外参与允许的K：")
             if intrinsic_stage.gate_passed:
                 current = intrinsic_stage.model
                 current_metrics = intrinsic_stage.metrics
+                current_has_intrinsic_solution = True
 
         if optimize_distortion:
             distortion_stage = optimize_stage(
                 "03_distortion_only", current, groups, rotations, centers,
                 seeds, graph, score_of(current_metrics),
                 False, False, False, True, args
+            )
+            distortion_stage.intrinsic_policy_satisfied = (
+                current_has_intrinsic_solution
             )
             stages.append(distortion_stage)
             show_stage(distortion_stage, "阶段3：固定K和外参，只优化畸变：")
@@ -2431,33 +2727,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seeds, graph, score_of(current_metrics),
                 True, optimize_reference, optimize_target, False, args
             )
+            # This stage either directly optimizes every requested K policy or
+            # no intrinsic optimization was requested at all.
+            geometry_stage.intrinsic_policy_satisfied = True
             stages.append(geometry_stage)
             show_stage(geometry_stage, "阶段4：固定畸变，回代优化外参与K：")
             if geometry_stage.gate_passed:
                 current = geometry_stage.model
                 current_metrics = geometry_stage.metrics
+                current_has_intrinsic_solution = True
 
             final_distortion_stage = optimize_stage(
                 "05_distortion_after_geometry", current, groups, rotations, centers,
                 seeds, graph, score_of(current_metrics),
                 False, False, False, True, args
             )
+            final_distortion_stage.intrinsic_policy_satisfied = (
+                current_has_intrinsic_solution
+            )
             stages.append(final_distortion_stage)
             show_stage(final_distortion_stage, "阶段5：最终固定几何复核畸变：")
 
-        passed = [stage for stage in stages if stage.gate_passed]
-        def selection_score(stage: StageResult) -> float:
-            value = stage.metrics["score"]["validation"]
-            return float(value if value is not None else stage.metrics["score"]["train"])
-        if args.force_accept:
-            selected = stages[-1]
-            accepted = False
-        elif passed:
-            selected = min(passed, key=selection_score)
-            accepted = True
-        else:
-            selected = min(stages, key=selection_score)
-            accepted = False
+        selected, accepted, passed = select_calibration_stage(
+            stages, args.force_accept
+        )
         final_model, unit, translation_scale = scaled_output_model(
             selected.model, args.scale_baseline_mm
         )
@@ -2479,8 +2772,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "pairs": [pair_label(pair) for pair in selected_pairs],
             },
             "policies": {
+                "intrinsics": intrinsic_policy,
                 "reference_intrinsics": args.reference_intrinsics,
                 "target_model": args.target_model,
+                "rig_motion_model": args.rig_motion_model,
                 "reference_distortion": args.reference_distortion,
                 "target_distortion": args.target_distortion,
                 "resolved_distortion_modes": args.resolved_distortion_modes,
@@ -2513,12 +2808,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "bound_hits": stage.bound_hits,
                     "gate_passed": stage.gate_passed,
                     "gate_reasons": stage.gate_reasons,
+                    "intrinsic_policy_satisfied": stage.intrinsic_policy_satisfied,
                 }
                 for stage in stages
             },
             "selection": {
                 "selected_stage": selected.name,
                 "accepted_for_use": accepted,
+                "required_intrinsic_policy_satisfied": (
+                    selected.intrinsic_policy_satisfied
+                ),
+                "eligible_stage_names": [stage.name for stage in passed],
                 "forced_output": args.force_accept,
                 "translation_output_scale_factor": translation_scale,
                 "final_metrics": selected.metrics,
@@ -2549,7 +2849,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         elif not accepted:
-            print("警告：没有阶段通过全部几何与物理质量门。", file=sys.stderr)
+            print(
+                "警告：没有阶段同时通过全部质量门并满足所需内参策略。",
+                file=sys.stderr,
+            )
         return 0 if accepted or args.force_accept else 2
     except KeyboardInterrupt:
         print("用户中断。", file=sys.stderr)
